@@ -6,19 +6,28 @@ Lightweight Swift package: install reporting, deterministic Apple Search Ads att
 
 ## Install
 
-Xcode → Add Package Dependency → point to this `sdk/` directory (local path or your git URL).
-iOS 14+, no third-party dependencies.
+Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
+Dependency Rule: Up to Next Major `1.0.0`. iOS 14+, no third-party dependencies.
+
+Swift Package Manager (`Package.swift`):
+
+```swift
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.0.0")
+```
 
 ## Usage
 
 ```swift
 import TrackHub
 
-// On app launch (e.g. in AppDelegate / @main init), after Apphud starts:
+// On app launch (e.g. in AppDelegate / @main init), after Apphud starts.
+// Copy the exact values (incl. sdkSecret) from the app's page in TrackHub →
+// SDK integration.
 TrackHub.configure(
     endpoint: URL(string: "https://postbacks.example.com")!, // your ingest domain
     ingestToken: "<app ingest token from the TrackHub app page>",
-    userId: Apphud.userID()   // ties installs to Apphud events
+    sdkSecret: "<app sdk secret>",   // optional; enables SDK Signature
+    userId: Apphud.userID()          // ties installs to Apphud events
 )
 
 // Wherever business events happen (revenue in minor units / cents):
