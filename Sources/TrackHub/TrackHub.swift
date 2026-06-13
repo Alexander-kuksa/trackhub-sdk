@@ -15,6 +15,9 @@ import CryptoKit
 /// TrackHub.track("trial_converted", revenueCents: 999)
 /// ```
 public enum TrackHub {
+    /// SDK version reported to the platform for integration detection.
+    public static let sdkVersion = "1.0.0"
+
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
     private static var schema: ConversionSchema?
@@ -91,7 +94,13 @@ public enum TrackHub {
         guard let config else { return }
         guard !UserDefaults.standard.bool(forKey: installSentKey) else { return }
 
-        var body: [String: Any] = ["user_id": config.userId]
+        // sdk_* fields go inside the signed body so the HMAC authenticates the
+        // integration marker too (no spoofable header).
+        var body: [String: Any] = [
+            "user_id": config.userId,
+            "sdk_name": "trackhub-ios",
+            "sdk_version": Self.sdkVersion,
+        ]
         #if os(iOS)
         body["platform"] = "ios"
         #endif
