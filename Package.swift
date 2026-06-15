@@ -11,7 +11,13 @@ let package = Package(
         .library(name: "TrackHub", targets: ["TrackHub"]),
     ],
     targets: [
-        .target(name: "TrackHub", path: "Sources/TrackHub"),
+        .target(
+            name: "TrackHub",
+            path: "Sources/TrackHub",
+            // ship the privacy manifest so embedding apps inherit no undeclared
+            // data-use / required-reason-API obligations
+            resources: [.copy("PrivacyInfo.xcprivacy")]
+        ),
         // Plain executable test runner: works with bare Command Line Tools
         // (no XCTest/Testing modules required). Run: swift run encoder-tests
         .executableTarget(
