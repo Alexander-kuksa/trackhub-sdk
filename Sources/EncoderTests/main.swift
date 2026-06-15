@@ -1,6 +1,6 @@
 import Foundation
 import CryptoKit
-import TrackHub
+@_spi(Testing) import TrackHub
 
 // Encoder parity tests (mirror of tests/skan.test.ts on the backend).
 // Run with: swift run encoder-tests — exits non-zero on any failure.

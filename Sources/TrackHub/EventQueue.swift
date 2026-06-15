@@ -3,7 +3,7 @@ import Foundation
 /// A buffered report awaiting delivery — path (relative to /ingest/{token}/) and
 /// the exact JSON body. The body is signed FRESH at send time, so a report
 /// buffered for hours still authenticates.
-public struct PendingReport: Codable, Equatable {
+@_spi(Testing) public struct PendingReport: Codable, Equatable {
     public let id: String
     public let path: String
     public let body: Data
@@ -20,7 +20,7 @@ public struct PendingReport: Codable, Equatable {
 /// Bounded, disk-persisted FIFO offline buffer. Failed sends (offline / 5xx) are
 /// retained and retried next launch; 2xx/4xx pop. At the cap the OLDEST reports
 /// are evicted. Platform-independent so it runs in the macOS parity tests.
-public final class EventQueue {
+@_spi(Testing) public final class EventQueue {
     private let maxItems: Int
     private let url: URL
     public private(set) var items: [PendingReport]

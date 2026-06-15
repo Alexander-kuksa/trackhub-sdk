@@ -1,10 +1,14 @@
 import Foundation
 
-/// Conversion value schema served by the TrackHub platform
-/// (`GET /ingest/{token}/cv-schema`). Mirrors `CvSchema` in the backend —
-/// the encoder below must stay in lockstep with `encodeConversionValue` there.
-public struct ConversionSchema: Codable, Equatable {
-    public struct Rule: Codable, Equatable {
+// These types are SDK internals (schema decode + SKAN encoder). They are SPI —
+// hidden from the app-facing TrackHub API; the macOS parity tests reach them via
+// `@_spi(Testing) import TrackHub`.
+
+/// Conversion value schema served by the platform (`GET /ingest/{token}/cv-schema`).
+/// Mirrors `CvSchema` in the backend — the encoder stays in lockstep with
+/// `encodeConversionValue` there.
+@_spi(Testing) public struct ConversionSchema: Codable, Equatable {
+    @_spi(Testing) public struct Rule: Codable, Equatable {
         public let from: Int
         public let to: Int
         public let event: String
@@ -48,7 +52,7 @@ public struct ConversionSchema: Codable, Equatable {
 }
 
 /// Result of encoding an app event into SKAN conversion values.
-public struct ConversionUpdate: Equatable {
+@_spi(Testing) public struct ConversionUpdate: Equatable {
     public let fine: Int
     /// "low" | "medium" | "high" | nil
     public let coarse: String?
@@ -61,10 +65,10 @@ public struct ConversionUpdate: Equatable {
     }
 }
 
-public enum ConversionEncoder {
-    /// event + optional revenue (in cents) → fine/coarse/lock. Mirrors the
-    /// backend `encodeConversionValue`: revenue is linearly bucketed into the
-    /// rule's fine range, clamped at the edges.
+@_spi(Testing) public enum ConversionEncoder {
+    /// event + optional revenue (cents) → fine/coarse/lock. Mirrors the backend
+    /// `encodeConversionValue`: revenue is linearly bucketed into the rule's fine
+    /// range, clamped at the edges.
     public static func encode(
         schema: ConversionSchema, event: String, revenueCents: Int? = nil
     ) -> ConversionUpdate? {

@@ -1,7 +1,7 @@
 import Foundation
 
 /// A new session that began on foreground — reported to /sdk/session.
-public struct SessionStart: Equatable {
+@_spi(Testing) public struct SessionStart: Equatable {
     public let sessionUid: String
     public let sessionNum: Int
     public let startedAt: Date
@@ -11,7 +11,7 @@ public struct SessionStart: Equatable {
 /// the macOS parity tests. A new session starts on first foreground, or when the
 /// gap since the last activity exceeds `timeout` (default 60s) — brief
 /// backgrounding coalesces. The session number is monotonic per install.
-public final class SessionTracker {
+@_spi(Testing) public final class SessionTracker {
     private let timeout: TimeInterval
     private let defaults: UserDefaults
     private let uuid: () -> String
