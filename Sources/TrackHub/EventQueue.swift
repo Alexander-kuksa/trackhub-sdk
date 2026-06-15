@@ -1,12 +1,11 @@
 import Foundation
 
-/// A buffered report awaiting delivery — the path (relative to /ingest/{token}/)
-/// and the exact JSON body. The body is signed FRESH at send time, so a report
-/// buffered for hours still authenticates (the SDK Signature timestamp is
-/// generated at flush, not when the event was created).
+/// A buffered report awaiting delivery — path (relative to /ingest/{token}/) and
+/// the exact JSON body. The body is signed FRESH at send time, so a report
+/// buffered for hours still authenticates.
 public struct PendingReport: Codable, Equatable {
     public let id: String
-    public let path: String // e.g. "sdk/session" | "sdk/track"
+    public let path: String
     public let body: Data
     public let createdAt: Date
 
@@ -18,11 +17,9 @@ public struct PendingReport: Codable, Equatable {
     }
 }
 
-/// Bounded, disk-persisted FIFO offline buffer. Reports that fail to send (no
-/// network / 5xx) are retained and retried on the next launch; 2xx and 4xx pop.
-/// At the cap the OLDEST reports are evicted (engagement data is best-effort and
-/// the server dedups retries, so dropping the tail is acceptable).
-/// Platform-independent (FileManager) so it runs in the macOS parity tests.
+/// Bounded, disk-persisted FIFO offline buffer. Failed sends (offline / 5xx) are
+/// retained and retried next launch; 2xx/4xx pop. At the cap the OLDEST reports
+/// are evicted. Platform-independent so it runs in the macOS parity tests.
 public final class EventQueue {
     private let maxItems: Int
     private let url: URL
@@ -31,21 +28,14 @@ public final class EventQueue {
     public init(maxItems: Int = 1000, url: URL) {
         self.maxItems = maxItems
         self.url = url
-        if let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode([PendingReport].self, from: data) {
-            self.items = decoded
-        } else {
-            self.items = []
-        }
+        self.items = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([PendingReport].self, from: $0) } ?? []
     }
 
     public var count: Int { items.count }
 
     public func enqueue(_ report: PendingReport) {
         items.append(report)
-        if items.count > maxItems {
-            items.removeFirst(items.count - maxItems) // evict oldest (FIFO)
-        }
+        if items.count > maxItems { items.removeFirst(items.count - maxItems) } // evict oldest
         persist()
     }
 
@@ -55,8 +45,6 @@ public final class EventQueue {
     }
 
     private func persist() {
-        if let data = try? JSONEncoder().encode(items) {
-            try? data.write(to: url, options: .atomic)
-        }
+        if let data = try? JSONEncoder().encode(items) { try? data.write(to: url, options: .atomic) }
     }
 }
