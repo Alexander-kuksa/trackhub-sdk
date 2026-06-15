@@ -79,5 +79,35 @@ let sigHex = sigMac.map { String(format: "%02x", $0) }.joined()
 check(sigHex == "40d56064e34d01661d8d5f7d8a15d1cab9fe32b9b1c8788cd53c19a4d5a755c5",
       "SDK signature HMAC matches the server vector")
 
+// ── Session coalescing (60s timeout, monotonic sequence) ──────────────────────
+let suiteName = "trackhub.parity.session"
+let suite = UserDefaults(suiteName: suiteName)!
+suite.removePersistentDomain(forName: suiteName)
+var sidN = 0
+let tracker = SessionTracker(timeout: 60, defaults: suite, uuid: { sidN += 1; return "sid\(sidN)" })
+let base = Date(timeIntervalSince1970: 1_000_000)
+let firstSession = tracker.foreground(at: base)
+check(firstSession?.sessionNum == 1 && firstSession?.sessionUid == "sid1",
+      "first foreground starts session 1")
+tracker.background(at: base.addingTimeInterval(10))
+check(tracker.foreground(at: base.addingTimeInterval(40)) == nil,
+      "foreground within 60s coalesces into the same session")
+tracker.background(at: base.addingTimeInterval(50))
+check(tracker.foreground(at: base.addingTimeInterval(200))?.sessionNum == 2,
+      "foreground after a >60s gap starts session 2 (monotonic sequence)")
+
+// ── Offline buffer (FIFO eviction + persistence + removal) ────────────────────
+let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("thq-\(UUID().uuidString).json")
+let q = EventQueue(maxItems: 2, url: tmp)
+q.enqueue(PendingReport(id: "a", path: "sdk/session", body: Data("1".utf8)))
+q.enqueue(PendingReport(id: "b", path: "sdk/track", body: Data("2".utf8)))
+q.enqueue(PendingReport(id: "c", path: "sdk/track", body: Data("3".utf8)))
+check(q.items.map { $0.id } == ["b", "c"], "offline buffer evicts the oldest at the cap (FIFO)")
+let reloaded = EventQueue(maxItems: 2, url: tmp)
+check(reloaded.items.map { $0.id } == ["b", "c"], "offline buffer persists across launches")
+reloaded.remove(id: "b")
+check(reloaded.items.map { $0.id } == ["c"], "remove(id:) pops a delivered report")
+try? FileManager.default.removeItem(at: tmp)
+
 print(failures == 0 ? "\nAll Swift tests passed (incl. signature parity)" : "\n\(failures) test(s) failed")
 exit(failures == 0 ? 0 : 1)

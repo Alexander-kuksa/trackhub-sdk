@@ -4,6 +4,9 @@ Lightweight Swift package: install reporting, deterministic Apple Search Ads att
 (AdServices token, resolved server-side) and remote-controlled SKAdNetwork conversion values
 (Conversion Hub — edit the schema in the TrackHub UI, devices pick it up without an app release).
 
+> **Full step-by-step integration walkthrough (where the call goes, SwiftUI vs UIKit,
+> verification, troubleshooting):** see [`INTEGRATION.md`](INTEGRATION.md).
+
 ## Install
 
 Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
@@ -30,9 +33,11 @@ TrackHub.configure(
     userId: Apphud.userID()          // ties installs to Apphud events
 )
 
-// Wherever business events happen (revenue in minor units / cents):
-TrackHub.track("trial_started")
-TrackHub.track("trial_converted", revenueCents: 999)
+// App sessions are tracked automatically after configure() (DAU/WAU/MAU + retention).
+
+// Custom events → TrackHub analytics (Engagement tab) + SKAN conversion values:
+TrackHub.trackEvent("trial_started")
+TrackHub.trackEvent("trial_converted", revenueCents: 999)
 ```
 
 What happens under the hood:
