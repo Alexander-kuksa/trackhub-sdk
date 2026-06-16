@@ -109,5 +109,13 @@ reloaded.remove(id: "b")
 check(reloaded.items.map { $0.id } == ["c"], "remove(id:) pops a delivered report")
 try? FileManager.default.removeItem(at: tmp)
 
+// ── Google click id extraction from a deep link (gbraid / wbraid) ─────────────
+let gb = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?gbraid=ABC123&utm_campaign=spring")!)
+check(gb.gbraid == "ABC123" && gb.wbraid == nil, "parses gbraid from a deep-link URL")
+let wb = TrackHub.parseGoogleClickIds(from: URL(string: "https://app.example.com/l?wbraid=WB9")!)
+check(wb.wbraid == "WB9" && wb.gbraid == nil, "parses wbraid from a universal-link URL")
+let none = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?foo=bar&gbraid=")!)
+check(none.gbraid == nil && none.wbraid == nil, "empty / absent click ids are treated as nil")
+
 print(failures == 0 ? "\nAll Swift tests passed (incl. signature parity)" : "\n\(failures) test(s) failed")
 exit(failures == 0 ? 0 : 1)

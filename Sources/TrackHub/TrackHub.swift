@@ -1,8 +1,9 @@
 import Foundation
 import CryptoKit
 
-/// TrackHub iOS SDK — installs (+ AdServices attribution), SKAN conversion values
-/// (Conversion Hub), app sessions (DAU/WAU/MAU + retention) and custom events.
+/// TrackHub iOS SDK — installs (+ AdServices ASA and Google gbraid/wbraid
+/// attribution), SKAN conversion values (Conversion Hub), app sessions
+/// (DAU/WAU/MAU + retention) and custom events.
 ///
 /// ```swift
 /// TrackHub.configure(endpoint: URL(string: "https://postbacks.example.com")!,
@@ -11,7 +12,7 @@ import CryptoKit
 /// ```
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.1.0"
+    public static let sdkVersion = "1.2.0"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -33,6 +34,8 @@ public enum TrackHub {
     private static let schemaCacheKey = "trackhub.cv_schema"
     private static let installSentKey = "trackhub.install_sent"
     private static let deviceIdKey = "trackhub.device_id"
+    private static let gbraidKey = "trackhub.gbraid"
+    private static let wbraidKey = "trackhub.wbraid"
     private static let iso8601 = ISO8601DateFormatter()
 
     // MARK: - Public API
@@ -68,9 +71,43 @@ public enum TrackHub {
         }
     }
 
-    /// Update the user id after configure (e.g. once Apphud resolves it).
+    /// Update the user id after configure (e.g. once the billing SDK resolves it).
     public static func setUserId(_ userId: String) {
         queue.async { config?.userId = userId }
+    }
+
+    /// Record a Google click identifier captured from the ad click's deep link:
+    /// `gbraid` (iOS app click) or `wbraid` (web-to-app). TrackHub attaches it to
+    /// the one-shot install report so the resulting purchase can be sent back to
+    /// Google Ads for that click — letting Smart Bidding optimize iOS App-campaign
+    /// traffic that carries a click id. Call this BEFORE `configure(...)` (the
+    /// install report is sent once, on first launch). Pure SKAdNetwork installs
+    /// carry no click id and stay SKAN-aggregate (Apple's privacy model).
+    public static func setGoogleClickId(gbraid: String? = nil, wbraid: String? = nil) {
+        if let g = gbraid, !g.isEmpty { UserDefaults.standard.set(g, forKey: gbraidKey) }
+        if let w = wbraid, !w.isEmpty { UserDefaults.standard.set(w, forKey: wbraidKey) }
+    }
+
+    /// Convenience over `setGoogleClickId`: extracts `gbraid` / `wbraid` from a
+    /// deep-link / universal-link URL's query and stores them. Returns true if a
+    /// Google click id was found. Call from your URL handler and, on a cold launch
+    /// from a click, from the launch URL — before `configure(...)`.
+    @discardableResult
+    public static func handleDeepLink(_ url: URL) -> Bool {
+        let ids = parseGoogleClickIds(from: url)
+        guard ids.gbraid != nil || ids.wbraid != nil else { return false }
+        setGoogleClickId(gbraid: ids.gbraid, wbraid: ids.wbraid)
+        return true
+    }
+
+    /// Pure URL → (gbraid, wbraid) extraction (empty values treated as absent).
+    @_spi(Testing) public static func parseGoogleClickIds(from url: URL) -> (gbraid: String?, wbraid: String?) {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func value(_ name: String) -> String? {
+            let v = items.first { $0.name == name }?.value
+            return (v?.isEmpty == false) ? v : nil
+        }
+        return (value("gbraid"), value("wbraid"))
     }
 
     /// Tracks a custom event → TrackHub analytics, and applies the SKAN
@@ -169,6 +206,11 @@ public enum TrackHub {
         body["os_version"] = ProcessInfo.processInfo.operatingSystemVersionString
         body["occurred_at"] = iso8601.string(from: Date())
         if let token = SKANUpdater.attributionToken() { body["adservices_token"] = token }
+        // Google click ids captured from a deep link (set via setGoogleClickId /
+        // handleDeepLink before configure) — the iOS path for user-level Google
+        // attribution + conversion return.
+        if let g = UserDefaults.standard.string(forKey: gbraidKey) { body["gbraid"] = g }
+        if let w = UserDefaults.standard.string(forKey: wbraidKey) { body["wbraid"] = w }
 
         let data = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
         postRaw(path: "install", bodyData: data) { ok in

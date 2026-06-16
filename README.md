@@ -40,11 +40,29 @@ TrackHub.trackEvent("trial_started")
 TrackHub.trackEvent("trial_converted", revenueCents: 999)
 ```
 
+### iOS Google Ads attribution (gbraid / wbraid)
+
+If a user arrives from a Google Ads click that carries a click id (iOS app click → `gbraid`,
+web-to-app → `wbraid`), capture it from the deep link **before** `configure(...)` so it rides the
+one-shot install report. TrackHub can then send the resulting purchase back to Google Ads for that
+click, so Smart Bidding optimizes on it:
+
+```swift
+// In your URL handler — and, on a cold launch from a click, the launch URL:
+TrackHub.handleDeepLink(url)            // pulls gbraid / wbraid from the URL query
+// …or set it directly if you obtained the id another way:
+TrackHub.setGoogleClickId(gbraid: "…")
+
+TrackHub.configure(/* … */)             // call AFTER the click id is set
+```
+
+Pure SKAdNetwork installs carry no click id and stay SKAN-aggregate (Apple's privacy model).
+
 What happens under the hood:
 
-- **First launch:** one `POST /ingest/{token}/install` with the AdServices attribution token —
-  the platform resolves it with Apple and stores campaign / ad group / keyword ids. Repeat
-  launches are no-ops (and a failed report retries next launch).
+- **First launch:** one `POST /ingest/{token}/install` with the AdServices attribution token
+  (resolved with Apple into ASA campaign / ad group / keyword ids) and any `gbraid` / `wbraid`
+  set beforehand. Repeat launches are no-ops (and a failed report retries next launch).
 - **Every launch:** the active conversion value schema is fetched from
   `GET /ingest/{token}/cv-schema` and cached locally.
 - **`track(event, revenueCents:)`:** the event is encoded via the schema (fine value 0–63 with
