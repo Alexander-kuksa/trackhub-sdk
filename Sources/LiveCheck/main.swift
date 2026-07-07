@@ -21,7 +21,9 @@ print("userId: \(userId)")
 TrackHub.configure(endpoint: endpoint, ingestToken: args[2], userId: userId, debug: true)
 Thread.sleep(forTimeInterval: 4) // let install report + schema fetch complete
 
-TrackHub.track("trial_started")
-TrackHub.track("trial_converted", revenueCents: 750)
+// trackEvent → POST /sdk/track (plus the on-device SKAN update, no-op off-device).
+// revenue_cents here is informational only — the revenue ledger comes from verified purchases.
+TrackHub.trackEvent("trial_started")
+TrackHub.trackEvent("trial_converted", revenueCents: 750)
 Thread.sleep(forTimeInterval: 2)
 print("live-check finished")

@@ -156,6 +156,10 @@ TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
 analytics. Prefer `trackEvent` for everything new. Events buffer offline and retry on the next
 launch, so a flaky network never drops them.
 
+Revenue/subscription tracking does **not** go through SDK events — Apphud/S2S webhooks are the
+source of truth. `revenueCents` on `trackEvent` is legacy/informational only (stored for
+reporting, never summed into ROAS).
+
 ---
 
 ## Permissions / Info.plist

@@ -35,9 +35,9 @@ TrackHub.configure(
 
 // App sessions are tracked automatically after configure() (DAU/WAU/MAU + retention).
 
-// Custom events → TrackHub analytics (Engagement tab) + SKAN conversion values:
+// Custom engagement events → TrackHub analytics (Engagement tab) + SKAN conversion values:
 TrackHub.trackEvent("trial_started")
-TrackHub.trackEvent("trial_converted", revenueCents: 999)
+TrackHub.trackEvent("paywall_viewed")
 ```
 
 ### iOS Google Ads attribution (gbraid / wbraid)
@@ -65,15 +65,20 @@ What happens under the hood:
   set beforehand. Repeat launches are no-ops (and a failed report retries next launch).
 - **Every launch:** the active conversion value schema is fetched from
   `GET /ingest/{token}/cv-schema` and cached locally.
-- **`track(event, revenueCents:)`:** the event is encoded via the schema (fine value 0–63 with
-  linear revenue bucketing, SKAN 4 coarse value, optional window lock) and applied through the
-  best available API: `updatePostbackConversionValue(_:coarseValue:lockWindow:)` on iOS 16.1+,
-  fine-only on 15.4+, legacy `updateConversionValue` on 14.x.
+- **`trackEvent(name, …)`:** sends the event to TrackHub analytics (`POST /ingest/{token}/sdk/track`,
+  buffered offline with retry) and also drives the on-device SKAN value via `track()`.
+- **`track(event, revenueCents:)` (SKAN-only, no analytics):** the event is encoded via the schema
+  (fine value 0–63 with linear revenue bucketing, SKAN 4 coarse value, optional window lock) and
+  applied through the best available API:
+  `updatePostbackConversionValue(_:coarseValue:lockWindow:)` on iOS 16.1+, fine-only on 15.4+,
+  legacy `updateConversionValue` on 14.x. No-op when the event has no rule in the active schema.
 
 ## Notes
 
-- The SDK never sends events to TrackHub analytics — revenue/trial data arrives via Apphud
-  webhooks. `track()` only drives SKAN conversion values on the device.
+- Revenue/subscription source of truth is Apphud/S2S (webhooks + server notifications), not SDK
+  events. `trackEvent` is for engagement events and SKAN signals; its `revenueCents` parameter is
+  legacy/informational only and is never summed into ROAS. `track()` (without "Event") only drives
+  SKAN conversion values on the device and sends no analytics.
 - AdServices tokens resolve on real devices only (not simulators).
 - Set `debug: true` in `configure` to see `[TrackHub]` log lines.
 
