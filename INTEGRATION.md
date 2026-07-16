@@ -18,12 +18,17 @@ plus ~5 lines of code.
 | **Install reporting** (first launch) | This SDK → `POST /ingest/{token}/install` |
 | **App sessions** (automatic) | This SDK → `POST /ingest/{token}/sdk/session` on every foreground (60s coalescing). Powers DAU/WAU/MAU + retention. **No code beyond `configure`.** |
 | **Custom events** | `TrackHub.trackEvent("name")` → `POST /ingest/{token}/sdk/track`; shown in the app's **Engagement** tab + Raw Data |
-| **Apple Search Ads attribution** (campaign / ad group / keyword) | This SDK sends the AdServices token; **TrackHub resolves it with Apple server‑side** |
+| **App Conversion purchase bridge** | `TrackHub.trackPurchaseObserved(...)` sends transaction identity + short-lived device context; Apphud supplies authoritative value/currency |
+| **Apple Search Ads attribution** | Dormant legacy contour; disabled by default in both SDK and backend |
 | **SKAdNetwork conversion values** (remote‑controlled via Conversion Hub) | This SDK applies the schema on‑device; schema edits in the UI need **no app release** |
-| **Revenue / trials / subscriptions / refunds** | Today: **Apphud webhooks → TrackHub**. (Full on‑device StoreKit revenue tracking is being added in a later SDK release — see `SDK_PARITY_PLAN.md`.) |
+| **Revenue / trials / subscriptions / refunds** | **Apphud/S2S → TrackHub** is the permanent financial source of truth; the SDK never sends client-authored money |
 
-So: this SDK makes **installs + sessions + custom events + attribution + SKAN** work on its own.
-Revenue currently flows through the Apphud connection; you need both for full ROAS today.
+So: this SDK makes **installs + sessions + custom events + attribution + SKAN/AdAttributionKit + Google device
+context** work on its own. Revenue flows through Apphud; Firebase is not required.
+
+Google's separate `GoogleAdsOnDeviceConversion` iOS package is optional. It improves Integrated
+Conversion Measurement in privacy-restricted iOS traffic, but is not needed for the base App
+Conversion API path and is not Firebase.
 
 ---
 
@@ -33,8 +38,8 @@ Revenue currently flows through the Apphud connection; you need both for full RO
 - The app already exists in TrackHub with **platform = iOS** (so it has an ingest token).
 - **Apphud is already integrated** in the app (the SDK ties installs to `Apphud.userID()` so
   installs and revenue events join on the same user).
-- A **real device** for testing — AdServices attribution tokens do **not** resolve on the
-  Simulator.
+- A **real device** for release QA. AdAttributionKit/SKAN postbacks are not a
+  simulator-level end-to-end attribution test.
 
 ---
 
@@ -42,12 +47,12 @@ Revenue currently flows through the Apphud connection; you need both for full RO
 
 **Xcode:** *File → Add Package Dependencies…* →
 `https://github.com/Alexander-kuksa/trackhub-sdk` → Dependency Rule: **Up to Next Major** from
-`1.0.0` → add the **`TrackHub`** library to your app target.
+`1.6.0` → add the **`TrackHub`** library to your app target.
 
 Or in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.0.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.6.0")
 // …and in the target's dependencies:
 .product(name: "TrackHub", package: "trackhub-sdk")
 ```
@@ -91,12 +96,24 @@ struct AutoClickerApp: App {
     init() {
         Apphud.start(apiKey: "<your Apphud key>")   // must come first
 
+        TrackHub.setGoogleAdsConsent(
+            adUserData: consent.adUserData,
+            adPersonalization: consent.adPersonalization,
+            eea: consent.isEea
+        )
         TrackHub.configure(
             endpoint: URL(string: "https://postbacks.daively.com")!,
             ingestToken: "<app ingest token>",
+            userId: Apphud.userID(),
             sdkSecret: "<app sdk secret>",          // omit this line if Signature is off
-            userId: Apphud.userID()
-            // , debug: true                         // uncomment while testing
+            // debug: true,                          // uncomment while testing
+            apphudAttributionHandler: { data, completion in
+                Apphud.addAttribution(
+                    data: ApphudAttributionData(rawData: data),
+                    from: .custom,
+                    callback: completion
+                )
+            }
         )
     }
 
@@ -122,12 +139,24 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
         Apphud.start(apiKey: "<your Apphud key>")   // must come first
 
+        TrackHub.setGoogleAdsConsent(
+            adUserData: consent.adUserData,
+            adPersonalization: consent.adPersonalization,
+            eea: consent.isEea
+        )
         TrackHub.configure(
             endpoint: URL(string: "https://postbacks.daively.com")!,
             ingestToken: "<app ingest token>",
+            userId: Apphud.userID(),
             sdkSecret: "<app sdk secret>",          // omit this line if Signature is off
-            userId: Apphud.userID()
-            // , debug: true
+            // debug: true,
+            apphudAttributionHandler: { data, completion in
+                Apphud.addAttribution(
+                    data: ApphudAttributionData(rawData: data),
+                    from: .custom,
+                    callback: completion
+                )
+            }
         )
         return true
     }
@@ -135,8 +164,40 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 ```
 
 `configure(…)` is safe to call every launch — it reports the install **only on first launch**
-(retries next launch if the network call fails), and refreshes the SKAN conversion schema each
+(retries next launch if the network call fails), and refreshes the Apple attribution conversion schema each
 launch. All work is async on a background queue; it never blocks the main thread.
+
+The Apphud handler is the same client-side handoff Apphud documents for MMPs
+such as Adjust. TrackHub first resolves attribution on its server, then calls
+the handler on the main queue. The SDK persists the returned touchpoint
+revision only when Apphud's callback returns `true`; network/Apphud failures
+retry after a later install/session success or `refreshApphudAttribution()`.
+The handler requires `sdkSecret`, because `/sdk/attribution` is always signed.
+
+### Optional iOS ICM (still no Firebase)
+
+For Google's improved Integrated Conversion Measurement, add the official standalone
+`https://github.com/googleads/google-ads-on-device-conversion-ios-sdk` package to the host app.
+Fetch its opaque info before the first TrackHub `configure` call:
+
+```swift
+import GoogleAdsOnDeviceConversion
+
+ConversionManager.sharedInstance.setFirstLaunchTime(TrackHub.firstOpenAt)
+ConversionManager.sharedInstance.fetchAggregateConversionInfo(for: .installation) { info, _ in
+    TrackHub.configure(
+        endpoint: URL(string: "https://postbacks.daively.com")!,
+        ingestToken: "<app ingest token>",
+        userId: Apphud.userID(),
+        sdkSecret: "<app sdk secret>",
+        googleOnDeviceMeasurementInfo: info
+    )
+}
+```
+
+Always call `configure` from the completion even when `info` is nil; base measurement continues
+normally. TrackHub caches a non-empty value (maximum 4096 bytes) and forwards it only as Google's
+documented `odm_info` parameter.
 
 ---
 
@@ -157,31 +218,64 @@ analytics. Prefer `trackEvent` for everything new. Events buffer offline and ret
 launch, so a flaky network never drops them.
 
 Revenue/subscription tracking does **not** go through SDK events — Apphud/S2S webhooks are the
-source of truth. `revenueCents` on `trackEvent` is legacy/informational only (stored for
-reporting, never summed into ROAS).
+source of truth. Current SDKs expose no revenue parameter on `trackEvent`.
+
+## Step 5 — Bridge a confirmed purchase to App Conversion
+
+After a successful store/Apphud purchase callback, pass the stable store transaction identity:
+
+```swift
+TrackHub.trackPurchaseObserved(
+    transactionId: String(transaction.id),
+    productId: transaction.productID
+)
+// StoreKit 2 convenience: TrackHub.trackPurchaseObserved(transaction)
+```
+
+The report contains no amount. TrackHub captures the real device context, encrypts it, waits for
+the matching Apphud webhook, uses Apphud value/currency, and deletes the standalone context after
+the join or a 72-hour TTL. `sdkSecret` is mandatory for this endpoint.
 
 ---
 
 ## Permissions / Info.plist
 
 - **Nothing to add.** No `Info.plist` keys are required.
-- **No App Tracking Transparency (ATT) prompt and no IDFA** — AdServices attribution and
-  SKAdNetwork are privacy‑preserving and work without the tracking permission.
+- **No IDFA is collected.** Configure Google consent signals before live App Conversion sends;
+  the host app remains responsible for ATT/consent disclosures required by its use case/region.
 - App Transport Security is satisfied (`https://postbacks.daively.com`); the SDK refuses any
   non‑HTTPS endpoint except `localhost`.
 
 ---
 
-## Step 5 — Verify it works
+## Step 6 — Verify it works
 
-1. Build and run on a **real device** (TestFlight/App Store build is best for AdServices;
-   development builds report the install, but the AdServices token resolves reliably only for
-   App Store / TestFlight installs).
+For the authoritative workflow, open **TrackHub → app → Setup → Integration Test Lab**,
+start an isolated run and pass its short-lived token only in the QA build:
+
+```swift
+TrackHub.configure(
+    endpoint: URL(string: "https://postbacks.daively.com")!,
+    ingestToken: "<app token>",
+    userId: Apphud.userID(),
+    sdkSecret: "<SDK secret>",
+    debug: true,
+    integrationTestToken: "<short-lived Test Lab run token>"
+)
+```
+
+The shadow run is isolated from production analytics and never calls Google. After it passes,
+remove the token from the build and use Test Lab's separately armed live canary to prove a real
+Google response. Google has no App Conversion sandbox; a live canary may be counted.
+
+1. Build and run on a **real device**; use TestFlight/App Store for the final attribution canary.
 2. With `debug: true`, watch the Xcode console for `[TrackHub]` lines:
    - `install reported`
    - `schema vN active (… rules)`
    - on `track(…)`: `event … → fine …, coarse …, lock …`
-3. In TrackHub, open **Apps → _your app_ → "SDK integration"**. The detection badge should move
+3. In TrackHub, open **Apps → _your app_ → Setup → Integration Test Lab**. The timeline should
+   show SDK report, signature, device IP, consent, first_open/session/custom event, purchase context,
+   Apphud webhook and transaction join. Outside shadow mode, the normal detection badge should move
    to **detected** (and **Signed** if you passed `sdkSecret`), and the counters update:
    *First seen / Last seen / SDK installs / Signed*. The app's **Installs** KPI starts counting.
 
@@ -199,19 +293,22 @@ the app's data).
 | No `[TrackHub]` logs at all | `debug: true` not set, or `configure` not reached. Confirm it runs on launch. |
 | `install reported` but app page still "not detected" | Detection reads the latest install; refresh the page. If Signature is **on** server‑side but you passed no `sdkSecret`, reports are rejected — pass the secret or disable Signature. |
 | Badge shows **detected (unsigned)** | App built without `sdkSecret` while Signature is on. Add the secret and rebuild. |
-| Attribution always organic | AdServices doesn't resolve on Simulator; test on a real device with an App Store / TestFlight build, and only ad‑driven installs carry a campaign. |
+| Legacy ASA attribution is absent | Expected by default. Re-enable both SDK `enableLegacyAsaAttribution` and backend `ENABLE_LEGACY_ASA_PROCESSING` only for an intentional rollback. |
 | `track(…) before schema is available` | Called before the first schema fetch finished; harmless — the next launch caches the schema. Schema also persists across launches once fetched. |
 
 ---
 
 ## How it behaves under the hood
 
-- **First launch:** one `POST /ingest/{token}/install` carrying the AdServices token, the
-  Apphud `user_id`, app/OS version, and the `sdk_name`/`sdk_version` integration markers (inside
+- **First launch:** one `POST /ingest/{token}/install` carrying the Apphud `user_id`, app/OS
+  version, and the `sdk_name`/`sdk_version` integration markers (inside
   the HMAC‑signed body when Signature is on). Repeat launches are no‑ops; a failed report
   retries next launch.
 - **Every launch:** `GET /ingest/{token}/cv-schema` refreshes and caches the active conversion
   schema, so Conversion Hub edits reach devices without an app release.
+- **Apphud attribution:** signed `POST /ingest/{token}/sdk/attribution` returns the selected
+  touchpoint without raw click IDs. The SDK passes it to Apphud as provider `.custom` and
+  suppresses a revision only after Apphud acknowledges it.
 - **`track`:** encodes the event via the schema (fine 0–63 + SKAN 4 coarse + optional window
   lock) and applies it with the richest API the OS supports (iOS 16.1+ fine+coarse+lock, 15.4+
   fine‑only, 14.x legacy).

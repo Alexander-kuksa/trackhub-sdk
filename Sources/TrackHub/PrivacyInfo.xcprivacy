@@ -4,10 +4,11 @@
 <dict>
   <!--
     Privacy manifest for the TrackHub SDK. Shipping it here means apps that embed
-    the SDK do NOT inherit undeclared data-use / required-reason-API obligations
-    (Apple requires SDK privacy manifests). The SDK does first-party measurement
-    only: it never uses the IDFA, requires no ATT prompt, and does not track in
-    Apple's sense (data goes to the developer's own TrackHub backend).
+    the SDK do NOT inherit undeclared data-use / required-reason-API obligations.
+    TrackHub never reads IDFA; it uses IDFV as Google's documented limited-
+    tracking iOS fallback and otherwise uses the zero-RDID/click-id path. The host
+    app remains responsible for matching these declarations to its configured
+    backend use, consent flow and App Store privacy answers.
   -->
   <key>NSPrivacyTracking</key>
   <false/>
@@ -16,7 +17,7 @@
   <key>NSPrivacyCollectedDataTypes</key>
   <array>
     <dict>
-      <!-- app sessions + custom events (analytics) -->
+      <!-- app sessions + custom events -->
       <key>NSPrivacyCollectedDataType</key>
       <string>NSPrivacyCollectedDataTypeProductInteraction</string>
       <key>NSPrivacyCollectedDataTypeLinked</key>
@@ -26,6 +27,65 @@
       <key>NSPrivacyCollectedDataTypePurposes</key>
       <array>
         <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+        <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- Apphud/account identity supplied by the host app -->
+      <key>NSPrivacyCollectedDataType</key>
+      <string>NSPrivacyCollectedDataTypeUserID</string>
+      <key>NSPrivacyCollectedDataTypeLinked</key>
+      <true/>
+      <key>NSPrivacyCollectedDataTypeTracking</key>
+      <false/>
+      <key>NSPrivacyCollectedDataTypePurposes</key>
+      <array>
+        <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+        <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+        <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- TrackHub's generated first-party installation identifier -->
+      <key>NSPrivacyCollectedDataType</key>
+      <string>NSPrivacyCollectedDataTypeDeviceID</string>
+      <key>NSPrivacyCollectedDataTypeLinked</key>
+      <true/>
+      <key>NSPrivacyCollectedDataTypeTracking</key>
+      <false/>
+      <key>NSPrivacyCollectedDataTypePurposes</key>
+      <array>
+        <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+        <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+        <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- observed transaction/product identity; price and currency stay in Apphud -->
+      <key>NSPrivacyCollectedDataType</key>
+      <string>NSPrivacyCollectedDataTypePurchaseHistory</string>
+      <key>NSPrivacyCollectedDataTypeLinked</key>
+      <true/>
+      <key>NSPrivacyCollectedDataTypeTracking</key>
+      <false/>
+      <key>NSPrivacyCollectedDataTypePurposes</key>
+      <array>
+        <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+        <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- AdServices/click identifiers used for advertising measurement -->
+      <key>NSPrivacyCollectedDataType</key>
+      <string>NSPrivacyCollectedDataTypeAdvertisingData</string>
+      <key>NSPrivacyCollectedDataTypeLinked</key>
+      <true/>
+      <key>NSPrivacyCollectedDataTypeTracking</key>
+      <false/>
+      <key>NSPrivacyCollectedDataTypePurposes</key>
+      <array>
+        <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+        <string>NSPrivacyCollectedDataTypePurposeDeveloperAdvertising</string>
       </array>
     </dict>
   </array>

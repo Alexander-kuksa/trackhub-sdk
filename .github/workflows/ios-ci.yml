@@ -1,0 +1,18 @@
+name: iOS SDK CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift build
+      - run: swift run encoder-tests
+      - name: Compile for iOS Simulator
+        run: xcodebuild -scheme TrackHub -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build

@@ -51,7 +51,7 @@ import Foundation
     }
 }
 
-/// Result of encoding an app event into SKAN conversion values.
+/// Result of encoding an app event into SKAN/AdAttributionKit conversion values.
 @_spi(Testing) public struct ConversionUpdate: Equatable {
     public let fine: Int
     /// "low" | "medium" | "high" | nil

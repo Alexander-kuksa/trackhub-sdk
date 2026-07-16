@@ -36,6 +36,16 @@ import Foundation
         return SessionStart(sessionUid: uuid(), sessionNum: seq, startedAt: now)
     }
 
+    /// A deep-link open is a re-engagement boundary even when the app was
+    /// already foregrounded. Start a new numbered session deterministically so
+    /// the click ids ride the corresponding `session_start` immediately.
+    public func forceForeground(at now: Date = Date()) -> SessionStart {
+        defaults.set(now, forKey: lastActivityKey)
+        let seq = defaults.integer(forKey: seqKey) + 1
+        defaults.set(seq, forKey: seqKey)
+        return SessionStart(sessionUid: uuid(), sessionNum: seq, startedAt: now)
+    }
+
     /// On background: extends the activity window so a quick return coalesces.
     public func background(at now: Date = Date()) {
         defaults.set(now, forKey: lastActivityKey)

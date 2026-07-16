@@ -95,6 +95,9 @@ check(tracker.foreground(at: base.addingTimeInterval(40)) == nil,
 tracker.background(at: base.addingTimeInterval(50))
 check(tracker.foreground(at: base.addingTimeInterval(200))?.sessionNum == 2,
       "foreground after a >60s gap starts session 2 (monotonic sequence)")
+let forcedSession = tracker.forceForeground(at: base.addingTimeInterval(201))
+check(forcedSession.sessionNum == 3 && forcedSession.sessionUid == "sid3",
+      "a deep-link re-engagement forces a new numbered session immediately")
 
 // ── Offline buffer (FIFO eviction + persistence + removal) ────────────────────
 let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("thq-\(UUID().uuidString).json")
@@ -109,13 +112,85 @@ reloaded.remove(id: "b")
 check(reloaded.items.map { $0.id } == ["c"], "remove(id:) pops a delivered report")
 try? FileManager.default.removeItem(at: tmp)
 
-// ── Google click id extraction from a deep link (gbraid / wbraid) ─────────────
+let productionQueue = TrackHub.offlineQueueNamespace(for: nil)
+let testQueueA = TrackHub.offlineQueueNamespace(for: "test-run-token-with-enough-entropy-a")
+let testQueueB = TrackHub.offlineQueueNamespace(for: "test-run-token-with-enough-entropy-b")
+check(productionQueue == "production", "production uses the stable offline queue namespace")
+check(testQueueA.hasPrefix("test-") && testQueueA != testQueueB,
+      "Test Lab runs use isolated token-hash queue namespaces")
+check(!testQueueA.contains("test-run-token"), "the raw Test Lab token is not written into the queue filename")
+
+// ── Google click id extraction from a deep link ───────────────────────────────
+let gc = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?gclid=CaseSensitiveGCLID")!)
+check(gc.gclid == "CaseSensitiveGCLID" && gc.gbraid == nil && gc.wbraid == nil,
+      "parses gclid from a deep-link URL")
 let gb = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?gbraid=ABC123&utm_campaign=spring")!)
-check(gb.gbraid == "ABC123" && gb.wbraid == nil, "parses gbraid from a deep-link URL")
+check(gb.gclid == nil && gb.gbraid == "ABC123" && gb.wbraid == nil, "parses gbraid from a deep-link URL")
 let wb = TrackHub.parseGoogleClickIds(from: URL(string: "https://app.example.com/l?wbraid=WB9")!)
-check(wb.wbraid == "WB9" && wb.gbraid == nil, "parses wbraid from a universal-link URL")
+check(wb.wbraid == "WB9" && wb.gclid == nil && wb.gbraid == nil, "parses wbraid from a universal-link URL")
 let none = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?foo=bar&gbraid=")!)
-check(none.gbraid == nil && none.wbraid == nil, "empty / absent click ids are treated as nil")
+check(none.gclid == nil && none.gbraid == nil && none.wbraid == nil, "empty / absent click ids are treated as nil")
+
+let reengagementTag = TrackHub.parseAdAttributionReengagementConversionTag(
+    from: URL(string: "https://app.example.com/offer?AdAttributionKitReengagementOpen=tag-123")!
+)
+check(reengagementTag == "tag-123", "extracts the AdAttributionKit re-engagement conversion tag")
+let noReengagementTag = TrackHub.parseAdAttributionReengagementConversionTag(
+    from: URL(string: "https://app.example.com/offer?AdAttributionKitReengagementOpen=")!
+)
+check(noReengagementTag == nil, "ignores an empty AdAttributionKit conversion tag")
+
+// ── Purchase context: identifiers only, never client-authored money ───────────────────
+let purchaseBody = TrackHub.purchaseContextBody(
+    transactionId: "2000000123456789",
+    productId: "com.example.monthly",
+    userId: "apphud-user",
+    occurredAt: Date(timeIntervalSince1970: 1_780_000_000),
+    firstOpenAt: Date(timeIntervalSince1970: 1_779_000_000)
+)
+check(purchaseBody["transaction_id"] as? String == "2000000123456789",
+      "purchase context carries the stable transaction id")
+check(purchaseBody["product_id"] as? String == "com.example.monthly",
+      "purchase context carries the product id")
+check(purchaseBody["first_open_at"] as? String == "2026-05-17T06:40:00Z",
+      "purchase context carries the stable first-open timestamp required as fot")
+check(purchaseBody["revenue_cents"] == nil && purchaseBody["currency"] == nil,
+      "purchase context never carries client-authored revenue")
+
+// ── Apphud attribution bridge revision dedup ──────────────────────────────────────
+let attributionSuiteName = "trackhub.parity.apphud-attribution"
+let attributionDefaults = UserDefaults(suiteName: attributionSuiteName)!
+attributionDefaults.removePersistentDomain(forName: attributionSuiteName)
+check(
+    TrackHub.shouldDeliverApphudAttribution(
+        revision: "tp-1",
+        userId: "apphud-user",
+        defaults: attributionDefaults
+    ),
+    "an unseen Apphud attribution revision is deliverable"
+)
+TrackHub.markApphudAttributionDelivered(
+    revision: "tp-1",
+    userId: "apphud-user",
+    defaults: attributionDefaults
+)
+check(
+    !TrackHub.shouldDeliverApphudAttribution(
+        revision: "tp-1",
+        userId: "apphud-user",
+        defaults: attributionDefaults
+    ),
+    "an acknowledged Apphud attribution revision is suppressed"
+)
+check(
+    TrackHub.shouldDeliverApphudAttribution(
+        revision: "tp-2",
+        userId: "apphud-user",
+        defaults: attributionDefaults
+    ),
+    "a changed Apphud attribution revision is deliverable"
+)
+attributionDefaults.removePersistentDomain(forName: attributionSuiteName)
 
 print(failures == 0 ? "\nAll Swift tests passed (incl. signature parity)" : "\n\(failures) test(s) failed")
 exit(failures == 0 ? 0 : 1)
