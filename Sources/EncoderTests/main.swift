@@ -72,11 +72,11 @@ if let decoded = try? JSONDecoder().decode(ConversionSchema.self, from: json) {
 }
 
 // SDK Signature HMAC parity with the server (tests/sdk-signature.test.ts):
-// HMAC-SHA256("parity" key, "123.tok.{\"a\":1}") must match the Node vector.
-let sigMsg = "123.tok.{\"a\":1}"
+// HMAC-SHA256("parity" key, v2 endpoint-bound message) must match Node/Android.
+let sigMsg = "123.tok.install.{\"a\":1}"
 let sigMac = HMAC<SHA256>.authenticationCode(for: Data(sigMsg.utf8), using: SymmetricKey(data: Data("parity".utf8)))
 let sigHex = sigMac.map { String(format: "%02x", $0) }.joined()
-check(sigHex == "40d56064e34d01661d8d5f7d8a15d1cab9fe32b9b1c8788cd53c19a4d5a755c5",
+check(sigHex == "48bd3ea5529853b246d18a578d1ce79aa50c2d3e7f69663b233bd696c5c8a91d",
       "SDK signature HMAC matches the server vector")
 
 // ── Session coalescing (60s timeout, monotonic sequence) ──────────────────────
@@ -120,6 +120,52 @@ check(testQueueA.hasPrefix("test-") && testQueueA != testQueueB,
       "Test Lab runs use isolated token-hash queue namespaces")
 check(!testQueueA.contains("test-run-token"), "the raw Test Lab token is not written into the queue filename")
 
+// ── Adjust-style first-session ATT wait ─────────────────────────────────
+check(TrackHub.normalizedATTConsentWaitingInterval(-1) == 0,
+      "negative ATT waiting intervals are disabled")
+check(TrackHub.normalizedATTConsentWaitingInterval(.infinity) == 0,
+      "non-finite ATT waiting intervals are disabled")
+check(TrackHub.normalizedATTConsentWaitingInterval(90) == 90,
+      "a valid ATT waiting interval is preserved")
+check(TrackHub.normalizedATTConsentWaitingInterval(999) == 360,
+      "ATT waiting interval is capped at the Adjust-compatible 360 seconds")
+check(
+    TrackHub.shouldDelayFirstSessionForATT(
+        waitingInterval: 120,
+        status: .notDetermined,
+        installAlreadySent: false,
+        integrationTest: false
+    ),
+    "a first production session waits while ATT is not determined"
+)
+check(
+    !TrackHub.shouldDelayFirstSessionForATT(
+        waitingInterval: 120,
+        status: .authorized,
+        installAlreadySent: false,
+        integrationTest: false
+    ),
+    "a resolved ATT status never delays the first session"
+)
+check(
+    !TrackHub.shouldDelayFirstSessionForATT(
+        waitingInterval: 120,
+        status: .notDetermined,
+        installAlreadySent: true,
+        integrationTest: false
+    ),
+    "ATT waiting applies only before the first install report"
+)
+check(
+    !TrackHub.shouldDelayFirstSessionForATT(
+        waitingInterval: 120,
+        status: .notDetermined,
+        installAlreadySent: false,
+        integrationTest: true
+    ),
+    "Integration Test Lab is never held by the ATT timer"
+)
+
 // ── Google click id extraction from a deep link ───────────────────────────────
 let gc = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?gclid=CaseSensitiveGCLID")!)
 check(gc.gclid == "CaseSensitiveGCLID" && gc.gbraid == nil && gc.wbraid == nil,
@@ -156,6 +202,58 @@ check(purchaseBody["first_open_at"] as? String == "2026-05-17T06:40:00Z",
       "purchase context carries the stable first-open timestamp required as fot")
 check(purchaseBody["revenue_cents"] == nil && purchaseBody["currency"] == nil,
       "purchase context never carries client-authored revenue")
+
+// ── Canonical sales funnel: stable names + placement parameter ───────────────
+check(
+    TrackHubSalesPlacement.allCases.map(\.rawValue) == [
+        "onboarding_placement",
+        "inapp_placement",
+        "special_placement",
+        "settings_placement",
+        "on_launch_placement",
+        "quick_action_placement",
+        "transaction_abandonment_placement",
+    ],
+    "sales placement enum matches the shared portfolio contract exactly"
+)
+
+let onboardingEvent = TrackHub.salesEventPayload(
+    .onboardingShown,
+    placement: nil,
+    callbackParams: ["flow_version": "b"]
+)
+check(
+    onboardingEvent?.name == "ob_shown" &&
+    onboardingEvent?.callbackParams["flow_version"] as? String == "b" &&
+    onboardingEvent?.callbackParams["placement_name"] == nil,
+    "onboarding event uses ob_shown without a placement suffix"
+)
+
+let paywallEvent = TrackHub.salesEventPayload(
+    .paywallShown,
+    placement: .onboarding,
+    callbackParams: ["placement_name": "caller-typo", "variant": "v2"]
+)
+check(
+    paywallEvent?.name == "pw_shown" &&
+    paywallEvent?.callbackParams["placement_name"] as? String == "onboarding_placement" &&
+    paywallEvent?.callbackParams["variant"] as? String == "v2",
+    "paywall event keeps the stable name and canonical placement_name parameter"
+)
+
+let ctaEvent = TrackHub.salesEventPayload(
+    .purchaseCtaTapped,
+    placement: .transactionAbandonment
+)
+check(
+    ctaEvent?.name == "purchase_cta_tapped" &&
+    ctaEvent?.callbackParams["placement_name"] as? String == "transaction_abandonment_placement",
+    "purchase CTA event carries transaction abandonment as a parameter"
+)
+check(
+    TrackHub.salesEventPayload(.paywallShown, placement: nil) == nil,
+    "placement-dependent sales events fail closed without a standard placement"
+)
 
 // ── Apphud attribution bridge revision dedup ──────────────────────────────────────
 let attributionSuiteName = "trackhub.parity.apphud-attribution"

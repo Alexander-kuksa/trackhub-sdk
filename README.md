@@ -9,24 +9,27 @@ remote-controlled SKAdNetwork and AdAttributionKit conversion values
 
 > **Build status.** GitHub Actions (`.github/workflows/ios-ci.yml`) builds the Swift package,
 > runs the executable contract suite and compiles the library for a generic iOS Simulator on
-> every push and pull request. The source below requires the `1.6.0` release tag to be published
+> every push and pull request. The source below requires the `1.9.0` release tag to be published
 > before consumer apps can resolve that version.
 
 ## Install
 
 Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
-Dependency Rule: Up to Next Major `1.6.0`. iOS 14+, no third-party dependencies.
+Dependency Rule: Up to Next Major `1.9.0`. iOS 14+, no third-party dependencies.
 
 Swift Package Manager (`Package.swift`):
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.6.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.9.0")
 ```
 
 ## Usage
 
 ```swift
 import TrackHub
+import ApphudSDK
+
+Apphud.start(apiKey: "<Apphud key>")
 
 TrackHub.setGoogleAdsConsent(
     adUserData: consent.adUserData,
@@ -47,22 +50,43 @@ TrackHub.setGoogleAdsConsent(
 TrackHub.configure(
     endpoint: URL(string: "https://postbacks.example.com")!, // your ingest domain
     ingestToken: "<app ingest token from the TrackHub app page>",
-    userId: Apphud.userID(),          // same custom user id in both SDKs
+    userId: Apphud.userID(),         // same custom user id in both SDKs
     sdkSecret: "<app sdk secret>",   // required for purchase + Apphud bridges
+    attConsentWaitingInterval: 120,  // first install waits for ATT, hard cap 360s
+    apphudDeviceIdentifiersHandler: { idfa, idfv in
+        Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
+    },
     apphudAttributionHandler: { data, completion in
-        Apphud.addAttribution(
+        Apphud.setAttribution(
             data: ApphudAttributionData(rawData: data),
             from: .custom,
-            callback: completion
+            identifer: nil,
+            callback: { accepted, _ in completion(accepted) }
         )
+    },
+    attributionChangedHandler: { attribution in
+        // Update app routing/UI when a delayed click or reattribution wins.
+        print(attribution.network, attribution.campaignId ?? "organic")
+    },
+    deferredDeepLinkHandler: { path in
+        // Route the one-time TrackHub measurement-link destination.
+        if let path { route(to: path) }
     }
 )
 
+// Show this only after your contextual explanation / onboarding step.
+// Requires NSUserTrackingUsageDescription in the host app's Info.plist.
+TrackHub.requestAppTrackingTransparency()
+
 // App sessions are tracked automatically after configure() (DAU/WAU/MAU + retention).
 
-// Custom engagement events → TrackHub analytics + SKAN/AdAttributionKit conversion values:
-TrackHub.trackEvent("trial_started")
-TrackHub.trackEvent("paywall_viewed", callbackParams: ["placement": "onboarding"])
+// Canonical sales funnel → TrackHub + Google (when the preset is enabled):
+TrackHub.trackOnboardingShown()                  // when onboarding becomes visible
+TrackHub.trackPaywallShown(at: .onboarding)      // when that paywall is presented
+TrackHub.trackPurchaseCtaTapped(at: .onboarding) // before StoreKit; trial or purchase CTA
+
+// Other custom engagement events:
+TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
 
 // After a successful store purchase, send only the stable transaction identity.
 // Apphud remains the source of truth for revenue/value/currency.
@@ -78,7 +102,7 @@ been explicitly re-enabled for legacy ASA processing.
 
 ### AdAttributionKit
 
-SDK 1.6 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
+SDK 1.8 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
 `AttributionCopyEndpoint` Info.plist key using the origin shown on the app page in TrackHub. To
 receive re-engagement copies, also enable
 `EligibleForAdAttributionKitReengagementPostbackCopies`.
@@ -141,6 +165,26 @@ ConversionManager.sharedInstance.fetchAggregateConversionInfo(for: .installation
 TrackHub caches this opaque value and forwards it as `odm_info` on first-open and downstream
 App Conversion requests. The standalone package is optional and is not Firebase.
 
+### Optional: uninstall measurement
+
+The host app keeps ownership of APNs registration. Forward the token from the normal AppDelegate
+callback; TrackHub does not request notification permission or call
+`registerForRemoteNotifications()` itself:
+
+```swift
+func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+) {
+    TrackHub.setPushToken(deviceToken, environment: .production)
+}
+```
+
+For a debug/sandbox APNs registration use `.sandbox`. The SDK persists the latest token, re-sends
+it after `configure`, and signs the delivery with SDK Signature v2. Link an APNs connection to the
+app in TrackHub before the daily silent uninstall probe can run. No user-visible notification is
+sent.
+
 What happens under the hood:
 
 - **First launch:** one `POST /ingest/{token}/install` with the available platform attribution
@@ -163,8 +207,19 @@ What happens under the hood:
   server temporarily captures the device context required by Google and releases the conversion
   only after the matching Apphud transaction arrives. `track()` (without "Event") only drives
   Apple attribution conversion values on the device and sends no analytics.
-- When an SDK event is explicitly mapped to a Google App Conversion custom event, its bounded
-  primitive `callbackParams` become `app_event_data`; `partnerParams` are not forwarded there.
+- `trackPaywallShown` and `trackPurchaseCtaTapped` always use the stable event names `pw_shown`
+  and `purchase_cta_tapped`. The standard placement is sent as the `placement_name` parameter,
+  never appended to the event name. TrackHub supports parameters end-to-end.
+- On iOS, configuration sends IDFV to Apphud immediately. After the explicit ATT request returns
+  `authorized`, TrackHub sends IDFA to Apphud and uses it for Google App Conversion; denied,
+  restricted and undetermined users keep the limited-tracking IDFV path.
+- `attConsentWaitingInterval` mirrors Adjust's first-session ATT wait. It applies only before the
+  first production install, buffers TrackHub install/session/events on disk, and releases them as
+  soon as ATT resolves or the timeout expires. Apphud IDFV delivery and Apple SKAN/
+  AdAttributionKit registration are never delayed. Values above 360 seconds are capped.
+- When an SDK event is explicitly mapped to a Google standard engagement or custom event, its
+  bounded primitive `callbackParams` become `app_event_data`; `partnerParams` are not forwarded
+  there. SDK events can never use purchase semantics or SDK-authored revenue.
 - Firebase is not required. Its optional `app_instance_id` bridge exists only for installations
   that deliberately keep GA4 forwarding alongside the App Conversion API.
 - Google's standalone iOS On-Device Conversion Measurement package is optional. When used,

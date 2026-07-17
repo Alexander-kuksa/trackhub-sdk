@@ -5,15 +5,18 @@
   <!--
     Privacy manifest for the TrackHub SDK. Shipping it here means apps that embed
     the SDK do NOT inherit undeclared data-use / required-reason-API obligations.
-    TrackHub never reads IDFA; it uses IDFV as Google's documented limited-
-    tracking iOS fallback and otherwise uses the zero-RDID/click-id path. The host
-    app remains responsible for matching these declarations to its configured
-    backend use, consent flow and App Store privacy answers.
+    When the host app explicitly requests ATT and receives authorization,
+    TrackHub reads IDFA for attribution and sends it to the configured TrackHub
+    endpoint and Apphud bridge. Without authorization it uses IDFV only as the
+    documented limited-tracking fallback. The host app remains responsible for
+    its consent UX, Apphud disclosure and App Store privacy answers.
   -->
   <key>NSPrivacyTracking</key>
-  <false/>
+  <true/>
   <key>NSPrivacyTrackingDomains</key>
-  <array/>
+  <array>
+    <string>postbacks.daively.com</string>
+  </array>
   <key>NSPrivacyCollectedDataTypes</key>
   <array>
     <dict>
@@ -23,7 +26,7 @@
       <key>NSPrivacyCollectedDataTypeLinked</key>
       <true/>
       <key>NSPrivacyCollectedDataTypeTracking</key>
-      <false/>
+      <true/>
       <key>NSPrivacyCollectedDataTypePurposes</key>
       <array>
         <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
@@ -37,7 +40,7 @@
       <key>NSPrivacyCollectedDataTypeLinked</key>
       <true/>
       <key>NSPrivacyCollectedDataTypeTracking</key>
-      <false/>
+      <true/>
       <key>NSPrivacyCollectedDataTypePurposes</key>
       <array>
         <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
@@ -46,13 +49,13 @@
       </array>
     </dict>
     <dict>
-      <!-- TrackHub's generated first-party installation identifier -->
+      <!-- TrackHub installation id plus ATT-authorized IDFA / fallback IDFV -->
       <key>NSPrivacyCollectedDataType</key>
       <string>NSPrivacyCollectedDataTypeDeviceID</string>
       <key>NSPrivacyCollectedDataTypeLinked</key>
       <true/>
       <key>NSPrivacyCollectedDataTypeTracking</key>
-      <false/>
+      <true/>
       <key>NSPrivacyCollectedDataTypePurposes</key>
       <array>
         <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
@@ -67,7 +70,7 @@
       <key>NSPrivacyCollectedDataTypeLinked</key>
       <true/>
       <key>NSPrivacyCollectedDataTypeTracking</key>
-      <false/>
+      <true/>
       <key>NSPrivacyCollectedDataTypePurposes</key>
       <array>
         <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
@@ -81,7 +84,7 @@
       <key>NSPrivacyCollectedDataTypeLinked</key>
       <true/>
       <key>NSPrivacyCollectedDataTypeTracking</key>
-      <false/>
+      <true/>
       <key>NSPrivacyCollectedDataTypePurposes</key>
       <array>
         <string>NSPrivacyCollectedDataTypePurposeAnalytics</string>

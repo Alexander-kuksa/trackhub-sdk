@@ -1,8 +1,8 @@
 # TrackHub iOS SDK — Integration Guide
 
 A complete, copy‑paste walkthrough for adding the TrackHub SDK to a **native iOS (Swift)**
-app. Hand this to whoever owns the app's Xcode project. The whole integration is one package
-plus ~5 lines of code.
+app. Hand this to whoever owns the app's Xcode project. The integration keeps Apphud as the
+financial source of truth while TrackHub owns attribution and product-event delivery.
 
 > The exact values you need (`endpoint`, `ingestToken`, and `sdkSecret` if SDK Signature is on)
 > are pre‑filled for your app in the TrackHub web UI:
@@ -47,12 +47,12 @@ Conversion API path and is not Firebase.
 
 **Xcode:** *File → Add Package Dependencies…* →
 `https://github.com/Alexander-kuksa/trackhub-sdk` → Dependency Rule: **Up to Next Major** from
-`1.6.0` → add the **`TrackHub`** library to your app target.
+`1.9.0` → add the **`TrackHub`** library to your app target.
 
 Or in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.6.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.9.0")
 // …and in the target's dependencies:
 .product(name: "TrackHub", package: "trackhub-sdk")
 ```
@@ -106,12 +106,17 @@ struct AutoClickerApp: App {
             ingestToken: "<app ingest token>",
             userId: Apphud.userID(),
             sdkSecret: "<app sdk secret>",          // omit this line if Signature is off
+            attConsentWaitingInterval: 120,          // 0=off; maximum 360 seconds
             // debug: true,                          // uncomment while testing
+            apphudDeviceIdentifiersHandler: { idfa, idfv in
+                Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
+            },
             apphudAttributionHandler: { data, completion in
-                Apphud.addAttribution(
+                Apphud.setAttribution(
                     data: ApphudAttributionData(rawData: data),
                     from: .custom,
-                    callback: completion
+                    identifer: nil,
+                    callback: { accepted, _ in completion(accepted) }
                 )
             }
         )
@@ -149,12 +154,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             ingestToken: "<app ingest token>",
             userId: Apphud.userID(),
             sdkSecret: "<app sdk secret>",          // omit this line if Signature is off
+            attConsentWaitingInterval: 120,          // 0=off; maximum 360 seconds
             // debug: true,
+            apphudDeviceIdentifiersHandler: { idfa, idfv in
+                Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
+            },
             apphudAttributionHandler: { data, completion in
-                Apphud.addAttribution(
+                Apphud.setAttribution(
                     data: ApphudAttributionData(rawData: data),
                     from: .custom,
-                    callback: completion
+                    identifer: nil,
+                    callback: { accepted, _ in completion(accepted) }
                 )
             }
         )
@@ -167,12 +177,32 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 (retries next launch if the network call fails), and refreshes the Apple attribution conversion schema each
 launch. All work is async on a background queue; it never blocks the main thread.
 
-The Apphud handler is the same client-side handoff Apphud documents for MMPs
-such as Adjust. TrackHub first resolves attribution on its server, then calls
+The Apphud handlers use the current official `setDeviceIdentifiers` and `setAttribution` APIs
+that Apphud documents for MMPs such as Adjust. TrackHub first resolves attribution on its server, then calls
 the handler on the main queue. The SDK persists the returned touchpoint
 revision only when Apphud's callback returns `true`; network/Apphud failures
 retry after a later install/session success or `refreshApphudAttribution()`.
 The handler requires `sdkSecret`, because `/sdk/attribution` is always signed.
+
+Configuration sends IDFV to Apphud immediately. Do not show ATT automatically at launch. After
+your own contextual explanation (commonly near the end of onboarding), call:
+
+```swift
+TrackHub.requestAppTrackingTransparency { status in
+    // optional: record or react to status; TrackHub/Apphud sync is automatic
+}
+```
+
+When authorization succeeds, TrackHub reads IDFA, calls the Apphud device-identifiers handler
+again with both IDFA and IDFV, and re-reports the latest ATT/device context to TrackHub. Denied,
+restricted and not-determined users continue on the IDFV limited-tracking path.
+
+With `attConsentWaitingInterval: 120`, the first production install/session and any early
+TrackHub events stay in the SDK's disk-backed queue until ATT returns a final status or 120
+seconds elapse. This is the Adjust-style waiting window: it affects only the first-ever install,
+does not delay Apphud's initial IDFV call or Apple attribution registration, and is capped at 360
+seconds. If iOS returns `notDetermined` because the app is inactive or another permission sheet is
+open, the wait remains active so the app can retry the prompt; the timeout is always the fallback.
 
 ### Optional iOS ICM (still no Firebase)
 
@@ -201,15 +231,39 @@ documented `odm_info` parameter.
 
 ---
 
-## Step 4 — (Optional) Track custom events
+## Step 4 — Track the sales funnel and custom events
 
-Sessions are automatic (Step 3). For your own funnel events, use **`trackEvent`** — it sends the
+Sessions are automatic (Step 3). For the standard sales funnel, use the typed helpers:
+
+```swift
+TrackHub.trackOnboardingShown()                       // ob_shown
+TrackHub.trackPaywallShown(at: .onboarding)           // pw_shown + placement_name
+TrackHub.trackPurchaseCtaTapped(at: .onboarding)      // purchase_cta_tapped + placement_name
+```
+
+Call the helpers at the actual UI boundary, not after a later outcome:
+
+| Helper | Exact trigger |
+|---|---|
+| `trackOnboardingShown()` | the onboarding becomes visible to the user |
+| `trackPaywallShown(at:)` | that placement's paywall is actually presented |
+| `trackPurchaseCtaTapped(at:)` | the purchase button is tapped, immediately before starting StoreKit; send this for both a trial CTA and a regular purchase CTA |
+
+`purchase_cta_tapped` is intent, not revenue and not purchase success. A failed, cancelled or
+abandoned StoreKit sheet therefore does not turn it into a paid conversion. If an abandonment
+offer/paywall is then presented, report that new surface with `.transactionAbandonment`.
+
+Available placements are `.onboarding`, `.inApp`, `.special`, `.settings`, `.onLaunch`,
+`.quickAction`, and `.transactionAbandonment`. TrackHub supports parameters, so it always sends
+the stable event names and puts the exact canonical value in `placement_name`; it never emits
+`pw_shown_{placement}` or `purchase_cta_tapped_{placement}`.
+
+For other funnel events, use **`trackEvent`** — it sends the
 event to TrackHub analytics (the **Engagement** tab's event explorer) AND, when the name matches
 a **Conversion Hub** rule, drives the on‑device SKAdNetwork conversion value:
 
 ```swift
 TrackHub.trackEvent("level_complete")
-TrackHub.trackEvent("trial_started")
 TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
 ```
 
@@ -240,9 +294,14 @@ the join or a 72-hour TTL. `sdkSecret` is mandatory for this endpoint.
 
 ## Permissions / Info.plist
 
-- **Nothing to add.** No `Info.plist` keys are required.
-- **No IDFA is collected.** Configure Google consent signals before live App Conversion sends;
-  the host app remains responsible for ATT/consent disclosures required by its use case/region.
+- Add **Privacy - Tracking Usage Description** (`NSUserTrackingUsageDescription`) with the
+  product-approved explanation shown in Apple's ATT alert. Without it TrackHub fails closed and
+  does not request permission.
+- The SDK never prompts from `configure`; the host app chooses the contextual moment and calls
+  `requestAppTrackingTransparency` explicitly.
+- Update App Store Connect App Privacy answers for Device ID, product interaction, purchases and
+  advertising attribution. The package privacy manifest declares the TrackHub side; the host app
+  remains responsible for its combined TrackHub + Apphud + ad-network behavior.
 - App Transport Security is satisfied (`https://postbacks.daively.com`); the SDK refuses any
   non‑HTTPS endpoint except `localhost`.
 

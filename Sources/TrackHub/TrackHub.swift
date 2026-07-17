@@ -6,6 +6,12 @@ import StoreKit
 #if os(iOS)
 import UIKit
 #endif
+#if os(iOS) && canImport(AppTrackingTransparency)
+import AppTrackingTransparency
+#endif
+#if os(iOS) && canImport(AdSupport)
+import AdSupport
+#endif
 
 /// TrackHub iOS SDK — installs (+ Google gclid/gbraid attribution), SKAN +
 /// AdAttributionKit conversion values (Conversion Hub), app sessions
@@ -23,16 +29,69 @@ public enum AdAttributionConversionTarget: Sendable, Equatable {
 }
 
 /// Adapter installed by the host app after Apphud starts. TrackHub has no hard
-/// dependency on ApphudSDK: pass `data` to Apphud's `.custom` attribution
-/// provider and call `completion(true)` only when Apphud acknowledges it.
+/// dependency on ApphudSDK: pass `data` to `Apphud.setAttribution(..., .custom)`
+/// and call `completion(true)` only when Apphud acknowledges it.
 public typealias ApphudAttributionHandler = (
     _ data: [String: String],
     _ completion: @escaping (Bool) -> Void
 ) -> Void
 
+/// Adapter for Apphud's official `setDeviceIdentifiers(idfa:idfv:)` method.
+/// TrackHub sends IDFV immediately after configuration and sends IDFA only when
+/// App Tracking Transparency is authorized.
+public typealias ApphudDeviceIdentifiersHandler = (
+    _ idfa: String?,
+    _ idfv: String?
+) -> Void
+
+public struct TrackHubAttribution: Sendable, Equatable {
+    public let revision: String
+    public let status: String
+    public let network: String
+    public let channel: String
+    public let campaignId: String?
+    public let adGroupId: String?
+    public let keywordId: String?
+    public let touchpointKind: String?
+    public let source: String?
+    public let data: [String: String]
+}
+
+public typealias TrackHubAttributionChangedHandler = (TrackHubAttribution) -> Void
+public typealias TrackHubDeferredDeepLinkHandler = (String?) -> Void
+
+public enum TrackHubTrackingAuthorizationStatus: String, Sendable, Equatable {
+    case notDetermined
+    case restricted
+    case denied
+    case authorized
+    case unavailable
+}
+
+public enum TrackHubPushEnvironment: String, Sendable, Equatable {
+    case production
+    case sandbox
+}
+
+public enum TrackHubSalesPlacement: String, CaseIterable, Sendable, Equatable {
+    case onboarding = "onboarding_placement"
+    case inApp = "inapp_placement"
+    case special = "special_placement"
+    case settings = "settings_placement"
+    case onLaunch = "on_launch_placement"
+    case quickAction = "quick_action_placement"
+    case transactionAbandonment = "transaction_abandonment_placement"
+}
+
+public enum TrackHubSalesEvent: String, Sendable, Equatable {
+    case onboardingShown = "ob_shown"
+    case paywallShown = "pw_shown"
+    case purchaseCtaTapped = "purchase_cta_tapped"
+}
+
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.6.1"
+    public static let sdkVersion = "1.9.0"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -41,6 +100,12 @@ public enum TrackHub {
     private static var sessionTracker: SessionTracker?
     private static var eventQueue: EventQueue?
     private static var apphudAttributionFetchInFlight = false
+    private static var currentAttributionSnapshot: TrackHubAttribution?
+    private static var attributionCompletions: [(TrackHubAttribution?) -> Void] = []
+    private static var deferredResolveInFlight = false
+    private static var trackingDisabled = false
+    private static var attConsentDelayActive = false
+    private static var attConsentDelayWorkItem: DispatchWorkItem?
     #if os(iOS)
     private static var lifecycleObserver: LifecycleObserver?
     #endif
@@ -51,14 +116,21 @@ public enum TrackHub {
         var userId: String
         let sdkSecret: String?
         let integrationTestToken: String?
+        let attConsentWaitingInterval: TimeInterval
         let legacyAsaAttributionEnabled: Bool
+        let apphudDeviceIdentifiersHandler: ApphudDeviceIdentifiersHandler?
         let apphudAttributionHandler: ApphudAttributionHandler?
+        let attributionChangedHandler: TrackHubAttributionChangedHandler?
+        let deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
     }
 
     private static let schemaCacheKey = "trackhub.cv_schema"
     private static let installSentKey = "trackhub.install_sent"
     private static let firstOpenAtKey = "trackhub.first_open_at"
     private static let deviceIdKey = "trackhub.device_id"
+    private static let installUidKey = "trackhub.install_uid"
+    private static let pushTokenKey = "trackhub.push_token.apns"
+    private static let pushEnvironmentKey = "trackhub.push_environment.apns"
     private static let gclidKey = "trackhub.gclid"
     private static let gbraidKey = "trackhub.gbraid"
     private static let wbraidKey = "trackhub.wbraid"
@@ -74,6 +146,8 @@ public enum TrackHub {
     private static let adsMeasurementConsentKey = "trackhub.consent.ads_measurement"
     private static let adAttributionConversionTagKey = "trackhub.ad_attribution.conversion_tag"
     private static let apphudAttributionRevisionKeyPrefix = "trackhub.apphud_attribution_revision."
+    private static let deferredResolveKeyPrefix = "trackhub.deferred_resolve."
+    private static let privacyDisabledKeyPrefix = "trackhub.privacy_disabled."
     private static let iso8601 = ISO8601DateFormatter()
 
     // MARK: - Public API
@@ -92,8 +166,12 @@ public enum TrackHub {
         googleOnDeviceMeasurementInfo: String? = nil,
         debug: Bool = false,
         integrationTestToken: String? = nil,
+        attConsentWaitingInterval: TimeInterval = 0,
         enableLegacyAsaAttribution: Bool = false,
-        apphudAttributionHandler: ApphudAttributionHandler? = nil
+        apphudDeviceIdentifiersHandler: ApphudDeviceIdentifiersHandler? = nil,
+        apphudAttributionHandler: ApphudAttributionHandler? = nil,
+        attributionChangedHandler: TrackHubAttributionChangedHandler? = nil,
+        deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = nil
     ) {
         // Refuse plaintext HTTP (token in transit + MITM schema poisoning); allow localhost for dev.
         guard endpoint.scheme == "https" || endpoint.host == "localhost" || endpoint.host == "127.0.0.1" else {
@@ -108,10 +186,21 @@ public enum TrackHub {
                 userId: userId ?? resolveDeviceId(),
                 sdkSecret: sdkSecret,
                 integrationTestToken: (testToken?.count ?? 0) >= 20 ? testToken : nil,
+                attConsentWaitingInterval: normalizedATTConsentWaitingInterval(attConsentWaitingInterval),
                 legacyAsaAttributionEnabled: enableLegacyAsaAttribution,
-                apphudAttributionHandler: apphudAttributionHandler
+                apphudDeviceIdentifiersHandler: apphudDeviceIdentifiersHandler,
+                apphudAttributionHandler: apphudAttributionHandler,
+                attributionChangedHandler: attributionChangedHandler,
+                deferredDeepLinkHandler: deferredDeepLinkHandler
+            )
+            trackingDisabled = UserDefaults.standard.bool(
+                forKey: privacyDisabledKey(token: ingestToken)
             )
             debugLogging = debug
+            if trackingDisabled {
+                log("tracking disabled after a forget-device request")
+                return
+            }
             if let aii = firebaseAppInstanceId, !aii.isEmpty {
                 UserDefaults.standard.set(aii, forKey: appInstanceIdKey)
             }
@@ -126,9 +215,13 @@ public enum TrackHub {
             // queue. Recreate on configure so switching modes cannot reuse the
             // previous in-memory queue accidentally.
             eventQueue = EventQueue(maxItems: 1000, url: queueFileURL(testToken: config?.integrationTestToken))
+            startATTConsentDelayIfNeeded()
+            publishApphudDeviceIdentifiers()
             SKANUpdater.registerForAttribution()
             reportInstallIfNeeded()
-            fetchApphudAttributionIfNeeded()
+            reportPushTokenIfAvailable()
+            fetchAttributionIfNeeded()
+            resolveDeferredDeepLinkIfNeeded()
             refreshSchema()
             startSessionTracking()
             flush()
@@ -140,14 +233,206 @@ public enum TrackHub {
         queue.async {
             guard !userId.isEmpty else { return }
             config?.userId = userId
-            fetchApphudAttributionIfNeeded()
+            reportPushTokenIfAvailable()
+            fetchAttributionIfNeeded()
         }
+    }
+
+    /// Forward the APNs registration token supplied by the host app. TrackHub
+    /// does not request notification permission and does not register for
+    /// remote notifications itself. Call from
+    /// application(_:didRegisterForRemoteNotificationsWithDeviceToken:).
+    public static func setPushToken(
+        _ deviceToken: Data,
+        environment: TrackHubPushEnvironment = .production
+    ) {
+        let value = deviceToken.map { String(format: "%02x", $0) }.joined()
+        setPushToken(value, environment: environment)
+    }
+
+    /// String overload for wrappers that already expose the APNs token as hex.
+    public static func setPushToken(
+        _ deviceToken: String,
+        environment: TrackHubPushEnvironment = .production
+    ) {
+        let value = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.count >= 32, value.count <= 4096 else { return }
+        UserDefaults.standard.set(value, forKey: pushTokenKey)
+        UserDefaults.standard.set(environment.rawValue, forKey: pushEnvironmentKey)
+        queue.async { reportPushTokenIfAvailable() }
     }
 
     /// Retry the TrackHub → Apphud bridge on demand (normally configure,
     /// install/session success and setUserId trigger it automatically).
     public static func refreshApphudAttribution() {
-        queue.async { fetchApphudAttributionIfNeeded() }
+        queue.async { fetchAttributionIfNeeded() }
+    }
+
+    /// Returns the durable TrackHub attribution snapshot. The completion is
+    /// always delivered on the main queue. A network refresh is made when the
+    /// current process has not fetched a snapshot yet.
+    public static func getAttribution(
+        completion: @escaping (TrackHubAttribution?) -> Void
+    ) {
+        queue.async {
+            if let currentAttributionSnapshot {
+                return DispatchQueue.main.async { completion(currentAttributionSnapshot) }
+            }
+            fetchAttributionIfNeeded(completion: completion)
+        }
+    }
+
+    /// Resolves a TrackHub measurement-link deep link once. The returned value
+    /// is the opaque path configured for the link (for example `/offer/annual`).
+    public static func resolveDeferredDeepLink(
+        completion: @escaping TrackHubDeferredDeepLinkHandler
+    ) {
+        queue.async { resolveDeferredDeepLinkIfNeeded(completion: completion) }
+    }
+
+    /// Permanently erases this app/user identity on TrackHub and disables all
+    /// subsequent SDK delivery for the current ingest token on this install.
+    public static func forgetDevice(
+        reason: String = "user_requested",
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        queue.async {
+            guard let config, config.sdkSecret?.isEmpty == false else {
+                return DispatchQueue.main.async { completion?(false) }
+            }
+            let boundedReason = String(reason.prefix(256))
+            let body: [String: Any] = ["user_id": config.userId, "reason": boundedReason]
+            guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+                return DispatchQueue.main.async { completion?(false) }
+            }
+            postRawResponse(path: "sdk/forget-device", bodyData: data) { status, _ in
+                queue.async {
+                    let accepted = isSuccess(status)
+                    if accepted {
+                        trackingDisabled = true
+                        UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
+                        currentAttributionSnapshot = nil
+                        UserDefaults.standard.removeObject(forKey: pushTokenKey)
+                        UserDefaults.standard.removeObject(forKey: pushEnvironmentKey)
+                        for report in eventQueue?.items ?? [] { eventQueue?.remove(id: report.id) }
+                    }
+                    DispatchQueue.main.async { completion?(accepted) }
+                }
+            }
+        }
+    }
+
+    /// Re-send the currently available identifiers to Apphud. Configuration
+    /// already does this once; the ATT completion also calls it automatically.
+    public static func syncApphudDeviceIdentifiers() {
+        queue.async { publishApphudDeviceIdentifiers() }
+    }
+
+    /// Present Apple's ATT prompt. Call this only after the app's contextual
+    /// explanation, at the product-appropriate moment. It is intentionally not
+    /// shown automatically from `configure`, because launch-time permission
+    /// prompts produce poor consent quality and make onboarding brittle.
+    ///
+    /// `NSUserTrackingUsageDescription` must be present in the host app's
+    /// Info.plist. IDFV is available regardless of the result; IDFA is exposed
+    /// and sent to Apphud/TrackHub only after `.authorized`.
+    public static func requestAppTrackingTransparency(
+        completion: ((TrackHubTrackingAuthorizationStatus) -> Void)? = nil
+    ) {
+        #if os(iOS) && canImport(AppTrackingTransparency) && canImport(AdSupport)
+        DispatchQueue.main.async {
+            let usage = Bundle.main.object(forInfoDictionaryKey: "NSUserTrackingUsageDescription") as? String
+            guard usage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+                log("NSUserTrackingUsageDescription is missing — ATT prompt skipped")
+                queue.async {
+                    finishATTConsentDelay(reason: "usage description missing")
+                }
+                completion?(.unavailable)
+                return
+            }
+            ATTrackingManager.requestTrackingAuthorization { status in
+                let mapped = trackingAuthorizationStatus(status)
+                queue.async {
+                    publishApphudDeviceIdentifiers()
+                    // Apple can return notDetermined without presenting a prompt
+                    // when the app is inactive or another permission sheet is
+                    // already visible. Keep waiting in that case; a later retry
+                    // or the hard timeout will release the first session.
+                    if mapped != .notDetermined {
+                        finishATTConsentDelay(reason: "ATT resolved: \(mapped.rawValue)")
+                    }
+                    reportConsentUpdateIfInstalled()
+                }
+                DispatchQueue.main.async { completion?(mapped) }
+            }
+        }
+        #else
+        DispatchQueue.main.async { completion?(.unavailable) }
+        #endif
+    }
+
+    /// Adjust-style bounded first-session wait. The value is deliberately
+    /// opt-in and capped at 360 seconds, matching Adjust's current ATT waiting
+    /// window. Apphud still receives IDFV immediately; only TrackHub's first
+    /// install/session/event network delivery waits for ATT or the timeout.
+    @_spi(Testing) public static func normalizedATTConsentWaitingInterval(
+        _ value: TimeInterval
+    ) -> TimeInterval {
+        guard value.isFinite, value > 0 else { return 0 }
+        return min(value, 360)
+    }
+
+    @_spi(Testing) public static func shouldDelayFirstSessionForATT(
+        waitingInterval: TimeInterval,
+        status: TrackHubTrackingAuthorizationStatus,
+        installAlreadySent: Bool,
+        integrationTest: Bool
+    ) -> Bool {
+        normalizedATTConsentWaitingInterval(waitingInterval) > 0 &&
+            status == .notDetermined &&
+            !installAlreadySent &&
+            !integrationTest
+    }
+
+    // On `queue`. Apple registration/schema work continues immediately; only
+    // user-level TrackHub delivery is held. Calls made during the wait go into
+    // the existing disk-backed FIFO so an app termination cannot lose them.
+    private static func startATTConsentDelayIfNeeded() {
+        attConsentDelayWorkItem?.cancel()
+        attConsentDelayWorkItem = nil
+        attConsentDelayActive = false
+        #if os(iOS) && canImport(AppTrackingTransparency)
+        guard let config else { return }
+        let status = trackingAuthorizationStatus(ATTrackingManager.trackingAuthorizationStatus)
+        let installAlreadySent = UserDefaults.standard.bool(forKey: installSentKey)
+        guard shouldDelayFirstSessionForATT(
+            waitingInterval: config.attConsentWaitingInterval,
+            status: status,
+            installAlreadySent: installAlreadySent,
+            integrationTest: config.integrationTestToken != nil
+        ) else { return }
+
+        let interval = config.attConsentWaitingInterval
+        attConsentDelayActive = true
+        let workItem = DispatchWorkItem {
+            finishATTConsentDelay(reason: "timeout after \(Int(interval))s")
+        }
+        attConsentDelayWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + interval, execute: workItem)
+        log("first session waiting up to \(Int(interval))s for ATT")
+        #endif
+    }
+
+    // On `queue`. Idempotent so ATT completion and timeout may race safely.
+    private static func finishATTConsentDelay(reason: String) {
+        guard attConsentDelayActive else { return }
+        attConsentDelayActive = false
+        attConsentDelayWorkItem?.cancel()
+        attConsentDelayWorkItem = nil
+        log("first-session ATT wait ended (\(reason))")
+        reportInstallIfNeeded()
+        flush()
+        fetchAttributionIfNeeded()
     }
 
     /// Provide the Firebase `app_instance_id` (from `Analytics.appInstanceID()`),
@@ -325,6 +610,89 @@ public enum TrackHub {
         )
     }
 
+    /// Track the canonical sales funnel used by the app portfolio. TrackHub and
+    /// Google App Conversion both support event parameters, so placement stays
+    /// in `placement_name`; it is never appended to the event name.
+    public static func trackSalesEvent(
+        _ event: TrackHubSalesEvent,
+        placement: TrackHubSalesPlacement? = nil,
+        callbackParams: [String: Any] = [:],
+        partnerParams: [String: Any] = [:],
+        adAttributionTarget: AdAttributionConversionTarget = .all,
+        conversionTag: String? = nil
+    ) {
+        guard let payload = salesEventPayload(
+            event,
+            placement: placement,
+            callbackParams: callbackParams
+        ) else {
+            return log("\(event.rawValue) requires a standard placement — skipped")
+        }
+        trackEvent(
+            payload.name,
+            callbackParams: payload.callbackParams,
+            partnerParams: partnerParams,
+            adAttributionTarget: adAttributionTarget,
+            conversionTag: conversionTag
+        )
+    }
+
+    public static func trackOnboardingShown(
+        callbackParams: [String: Any] = [:],
+        partnerParams: [String: Any] = [:]
+    ) {
+        trackSalesEvent(
+            .onboardingShown,
+            callbackParams: callbackParams,
+            partnerParams: partnerParams
+        )
+    }
+
+    public static func trackPaywallShown(
+        at placement: TrackHubSalesPlacement,
+        callbackParams: [String: Any] = [:],
+        partnerParams: [String: Any] = [:]
+    ) {
+        trackSalesEvent(
+            .paywallShown,
+            placement: placement,
+            callbackParams: callbackParams,
+            partnerParams: partnerParams
+        )
+    }
+
+    public static func trackPurchaseCtaTapped(
+        at placement: TrackHubSalesPlacement,
+        callbackParams: [String: Any] = [:],
+        partnerParams: [String: Any] = [:]
+    ) {
+        trackSalesEvent(
+            .purchaseCtaTapped,
+            placement: placement,
+            callbackParams: callbackParams,
+            partnerParams: partnerParams
+        )
+    }
+
+    @_spi(Testing) public static func salesEventPayload(
+        _ event: TrackHubSalesEvent,
+        placement: TrackHubSalesPlacement?,
+        callbackParams: [String: Any] = [:]
+    ) -> (name: String, callbackParams: [String: Any])? {
+        var params = callbackParams
+        // The canonical placement always wins over a caller-supplied free-form
+        // value, so dashboards and Google goals never split on spelling drift.
+        params.removeValue(forKey: "placement_name")
+        switch event {
+        case .onboardingShown:
+            return (event.rawValue, params)
+        case .paywallShown, .purchaseCtaTapped:
+            guard let placement else { return nil }
+            params["placement_name"] = placement.rawValue
+            return (event.rawValue, params)
+        }
+    }
+
     /// Records only the device-side observation needed by Google's App
     /// Conversion API. No money is accepted here: the matching Apphud webhook
     /// supplies verified value/currency. `transactionId` must be the same stable
@@ -466,7 +834,7 @@ public enum TrackHub {
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
         send(path: "sdk/session", body: body) { status in
-            if isSuccess(status) { queue.async { fetchApphudAttributionIfNeeded() } }
+            if isSuccess(status) { queue.async { fetchAttributionIfNeeded() } }
         }
     }
 
@@ -478,9 +846,13 @@ public enum TrackHub {
         guard let config else { return }
         let isIntegrationTest = config.integrationTestToken != nil
         guard isIntegrationTest || !UserDefaults.standard.bool(forKey: installSentKey) else { return }
+        guard !attConsentDelayActive else {
+            return log("install held until ATT resolves or the first-session timeout expires")
+        }
         // sdk_* go inside the signed body so the HMAC authenticates the integration marker too.
         var body: [String: Any] = [
             "user_id": config.userId,
+            "install_uid": resolveInstallUid(),
             "sdk_name": "trackhub-ios",
             "sdk_version": Self.sdkVersion,
         ]
@@ -518,12 +890,33 @@ public enum TrackHub {
                 if !isIntegrationTest {
                     queue.async {
                         reportConsentUpdate()
-                        fetchApphudAttributionIfNeeded()
+                        fetchAttributionIfNeeded()
                     }
                 }
             }
             else { log("install report failed — will retry on next launch") }
         }
+    }
+
+    private static func reportPushTokenIfAvailable() {
+        guard let config,
+              config.integrationTestToken == nil,
+              config.sdkSecret?.isEmpty == false,
+              !trackingDisabled,
+              let token = UserDefaults.standard.string(forKey: pushTokenKey),
+              token.count >= 32 else { return }
+        let environment = UserDefaults.standard.string(forKey: pushEnvironmentKey)
+            ?? TrackHubPushEnvironment.production.rawValue
+        let body: [String: Any] = [
+            "user_id": config.userId,
+            "install_uid": resolveInstallUid(),
+            "provider": "apns",
+            "environment": environment,
+            "token": token,
+            "sdk_name": "trackhub-ios",
+            "sdk_version": Self.sdkVersion,
+        ]
+        send(path: "sdk/push-token", body: body)
     }
 
     private static func appendConsent(to body: inout [String: Any]) {
@@ -544,6 +937,10 @@ public enum TrackHub {
         if defaults.object(forKey: adsMeasurementConsentKey) != nil {
             body["ads_measurement_consent"] = defaults.bool(forKey: adsMeasurementConsentKey)
         }
+        #if os(iOS) && canImport(AppTrackingTransparency)
+        let status = trackingAuthorizationStatus(ATTrackingManager.trackingAuthorizationStatus)
+        if status != .unavailable { body["att_status"] = status.rawValue }
+        #endif
     }
 
     private static func reportConsentUpdate() {
@@ -588,7 +985,7 @@ public enum TrackHub {
         return try? JSONDecoder().decode(ConversionSchema.self, from: data)
     }
 
-    // MARK: - Apphud attribution bridge
+    // MARK: - Attribution + Apphud bridge
 
     private struct ApphudAttributionEnvelope: Decodable {
         let ok: Bool
@@ -623,14 +1020,47 @@ public enum TrackHub {
         defaults.set(revision, forKey: apphudAttributionRevisionKey(userId: userId))
     }
 
-    // On `queue`. Only production calls are eligible: a Test Lab run must not
-    // mutate the real Apphud customer profile.
-    private static func fetchApphudAttributionIfNeeded() {
-        guard !apphudAttributionFetchInFlight, let config,
-              config.integrationTestToken == nil,
-              let handler = config.apphudAttributionHandler else { return }
+    private static func attribution(from snapshot: ApphudAttributionSnapshot) -> TrackHubAttribution {
+        TrackHubAttribution(
+            revision: snapshot.revision,
+            status: snapshot.data["status"] ?? "unknown",
+            network: snapshot.data["network"] ?? "unknown",
+            channel: snapshot.data["channel"] ?? "unknown",
+            campaignId: snapshot.data["campaign"],
+            adGroupId: snapshot.data["adgroup"],
+            keywordId: snapshot.data["keyword"],
+            touchpointKind: snapshot.data["touchpoint_kind"],
+            source: snapshot.data["attribution_source"],
+            data: snapshot.data
+        )
+    }
+
+    private static func finishAttributionCompletions(_ value: TrackHubAttribution?) {
+        let completions = attributionCompletions
+        attributionCompletions.removeAll()
+        guard !completions.isEmpty else { return }
+        DispatchQueue.main.async { completions.forEach { $0(value) } }
+    }
+
+    // On `queue`. Only production calls are eligible: Test Lab must not mutate
+    // the real attribution/Apphud profile.
+    private static func fetchAttributionIfNeeded(
+        completion: ((TrackHubAttribution?) -> Void)? = nil
+    ) {
+        if let completion { attributionCompletions.append(completion) }
+        guard !trackingDisabled else {
+            finishAttributionCompletions(nil)
+            return
+        }
+        guard !attConsentDelayActive else { return }
+        guard !apphudAttributionFetchInFlight else { return }
+        guard let config, config.integrationTestToken == nil else {
+            finishAttributionCompletions(nil)
+            return
+        }
         guard config.sdkSecret?.isEmpty == false else {
-            return log("Apphud attribution bridge requires sdkSecret")
+            finishAttributionCompletions(nil)
+            return log("attribution fetch requires sdkSecret")
         }
         let body: [String: Any] = [
             "user_id": config.userId,
@@ -645,10 +1075,19 @@ public enum TrackHub {
                       let envelope = try? JSONDecoder().decode(ApphudAttributionEnvelope.self, from: responseData),
                       envelope.ok, let snapshot = envelope.attribution,
                       snapshot.provider == "custom" else {
-                    if isRetryable(status) { log("Apphud attribution fetch failed — will retry") }
+                    finishAttributionCompletions(nil)
+                    if isRetryable(status) { log("attribution fetch failed — will retry") }
                     return
                 }
-                guard shouldDeliverApphudAttribution(
+                let resolved = attribution(from: snapshot)
+                let changed = currentAttributionSnapshot?.revision != resolved.revision
+                currentAttributionSnapshot = resolved
+                finishAttributionCompletions(resolved)
+                if changed, let handler = config.attributionChangedHandler {
+                    DispatchQueue.main.async { handler(resolved) }
+                }
+                guard let handler = config.apphudAttributionHandler,
+                      shouldDeliverApphudAttribution(
                     revision: snapshot.revision,
                     userId: config.userId
                 ) else { return }
@@ -669,6 +1108,65 @@ public enum TrackHub {
                 }
             }
         }
+    }
+
+    private struct DeferredDeepLinkEnvelope: Decodable {
+        let deepLinkPath: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case deepLinkPath = "deep_link_path"
+        }
+    }
+
+    private static func deferredResolveKey(token: String) -> String {
+        let digest = SHA256.hash(data: Data(token.utf8))
+        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return deferredResolveKeyPrefix + suffix
+    }
+
+    private static func privacyDisabledKey(token: String) -> String {
+        let digest = SHA256.hash(data: Data(token.utf8))
+        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return privacyDisabledKeyPrefix + suffix
+    }
+
+    private static func resolveDeferredDeepLinkIfNeeded(
+        completion: TrackHubDeferredDeepLinkHandler? = nil
+    ) {
+        guard !trackingDisabled else {
+            if let completion { DispatchQueue.main.async { completion(nil) } }
+            return
+        }
+        guard !deferredResolveInFlight, let config, config.integrationTestToken == nil else {
+            if let completion { DispatchQueue.main.async { completion(nil) } }
+            return
+        }
+        let handler = completion ?? config.deferredDeepLinkHandler
+        guard let handler else { return }
+        let resolvedKey = deferredResolveKey(token: config.ingestToken)
+        if UserDefaults.standard.bool(forKey: resolvedKey) {
+            if completion != nil { DispatchQueue.main.async { handler(nil) } }
+            return
+        }
+        let url = config.endpoint
+            .appendingPathComponent("ingest")
+            .appendingPathComponent(config.ingestToken)
+            .appendingPathComponent("resolve")
+        deferredResolveInFlight = true
+        URLSession.shared.dataTask(with: url) { data, response, _ in
+            queue.async {
+                deferredResolveInFlight = false
+                guard let http = response as? HTTPURLResponse,
+                      http.statusCode == 200,
+                      let data,
+                      let envelope = try? JSONDecoder().decode(DeferredDeepLinkEnvelope.self, from: data) else {
+                    DispatchQueue.main.async { handler(nil) }
+                    return
+                }
+                UserDefaults.standard.set(true, forKey: resolvedKey)
+                DispatchQueue.main.async { handler(envelope.deepLinkPath) }
+            }
+        }.resume()
     }
 
     // MARK: - Offline buffer + networking
@@ -694,6 +1192,7 @@ public enum TrackHub {
         body: [String: Any],
         completion: ((Int?) -> Void)? = nil
     ) {
+        guard !trackingDisabled else { return }
         var payload = body
         if let testToken = config?.integrationTestToken { payload["test_run_token"] = testToken }
         let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
@@ -702,6 +1201,11 @@ public enum TrackHub {
         // mutable global then could put a production failure in a Test Lab
         // queue (or the reverse).
         let targetQueue = eventQueue
+        if attConsentDelayActive {
+            targetQueue?.enqueue(PendingReport(path: path, body: data))
+            log("\(path) buffered during first-session ATT wait")
+            return
+        }
         postRaw(path: path, bodyData: data) { status in
             if isRetryable(status) {
                 queue.async { targetQueue?.enqueue(PendingReport(path: path, body: data)) }
@@ -716,6 +1220,8 @@ public enum TrackHub {
     // timestamp never rejects buffered traffic. Success/permanent rejects pop;
     // only transient failures stay.
     private static func flush() {
+        guard !trackingDisabled else { return }
+        guard !attConsentDelayActive else { return }
         guard let q = eventQueue else { return }
         for report in q.items {
             postRaw(path: report.path, bodyData: report.body) { status in
@@ -732,6 +1238,15 @@ public enum TrackHub {
         if let existing = UserDefaults.standard.string(forKey: deviceIdKey) { return existing }
         let id = "dev_" + UUID().uuidString
         UserDefaults.standard.set(id, forKey: deviceIdKey)
+        return id
+    }
+
+    private static func resolveInstallUid() -> String {
+        if let existing = UserDefaults.standard.string(forKey: installUidKey), !existing.isEmpty {
+            return existing
+        }
+        let id = UUID().uuidString
+        UserDefaults.standard.set(id, forKey: installUidKey)
         return id
     }
 
@@ -776,13 +1291,52 @@ public enum TrackHub {
 
     private static func appendAppConversionDeviceIdentifier(to body: inout [String: Any]) {
         #if os(iOS)
-        // Google documents IDFV as the iOS fallback when IDFA is unavailable.
-        // TrackHub does not read IDFA; the fallback is always limited-tracking.
-        guard config?.sdkSecret?.isEmpty == false,
-              let value = UIDevice.current.identifierForVendor?.uuidString else { return }
-        body["device_id"] = value
-        body["device_id_type"] = "idfv"
-        body["limit_ad_tracking"] = true
+        guard config?.sdkSecret?.isEmpty == false else { return }
+        if let idfa = currentAuthorizedIDFA() {
+            body["device_id"] = idfa
+            body["device_id_type"] = "idfa"
+            body["limit_ad_tracking"] = false
+        } else if let idfv = UIDevice.current.identifierForVendor?.uuidString {
+            // Google documents IDFV as the limited-tracking iOS fallback when
+            // IDFA is unavailable or ATT was not authorized.
+            body["device_id"] = idfv
+            body["device_id_type"] = "idfv"
+            body["limit_ad_tracking"] = true
+        }
+        #endif
+    }
+
+    private static func publishApphudDeviceIdentifiers() {
+        #if os(iOS)
+        guard let handler = config?.apphudDeviceIdentifiersHandler else { return }
+        let idfa = currentAuthorizedIDFA()
+        let idfv = UIDevice.current.identifierForVendor?.uuidString
+        DispatchQueue.main.async { handler(idfa, idfv) }
+        #endif
+    }
+
+    #if os(iOS) && canImport(AppTrackingTransparency)
+    private static func trackingAuthorizationStatus(
+        _ status: ATTrackingManager.AuthorizationStatus
+    ) -> TrackHubTrackingAuthorizationStatus {
+        switch status {
+        case .notDetermined: return .notDetermined
+        case .restricted: return .restricted
+        case .denied: return .denied
+        case .authorized: return .authorized
+        @unknown default: return .unavailable
+        }
+    }
+    #endif
+
+    private static func currentAuthorizedIDFA() -> String? {
+        #if os(iOS) && canImport(AppTrackingTransparency) && canImport(AdSupport)
+        guard ATTrackingManager.trackingAuthorizationStatus == .authorized else { return nil }
+        let value = ASIdentifierManager.shared().advertisingIdentifier
+        guard value != UUID(uuidString: "00000000-0000-0000-0000-000000000000") else { return nil }
+        return value.uuidString
+        #else
+        return nil
         #endif
     }
 
@@ -815,9 +1369,11 @@ public enum TrackHub {
         request.httpBody = bodyData
         if let secret = config.sdkSecret, !secret.isEmpty {
             let ts = String(Int(Date().timeIntervalSince1970 * 1000))
-            let message = "\(ts).\(config.ingestToken).\(String(data: bodyData, encoding: .utf8) ?? "")"
+            let scope = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let message = "\(ts).\(config.ingestToken).\(scope).\(String(data: bodyData, encoding: .utf8) ?? "")"
             let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: Data(secret.utf8)))
             request.setValue(ts, forHTTPHeaderField: "X-TrackHub-Timestamp")
+            request.setValue("2", forHTTPHeaderField: "X-TrackHub-Signature-Version")
             request.setValue(mac.map { String(format: "%02x", $0) }.joined(), forHTTPHeaderField: "X-TrackHub-Signature")
         }
         URLSession.shared.dataTask(with: request) { data, response, _ in
