@@ -18,13 +18,15 @@ financial source of truth while TrackHub owns attribution and product-event deli
 | **Install reporting** (first launch) | This SDK → `POST /ingest/{token}/install` |
 | **App sessions** (automatic) | This SDK → `POST /ingest/{token}/sdk/session` on every foreground (60s coalescing). Powers DAU/WAU/MAU + retention. **No code beyond `configure`.** |
 | **Custom events** | `TrackHub.trackEvent("name")` → `POST /ingest/{token}/sdk/track`; shown in the app's **Engagement** tab + Raw Data |
+| **User-level attribution / erasure** | Host app's authenticated backend → TrackHub with the linked S2S secret; the SDK receives only the response, never that secret |
 | **App Conversion purchase bridge** | `TrackHub.trackPurchaseObserved(...)` sends transaction identity + short-lived device context; Apphud supplies authoritative value/currency |
 | **Apple Search Ads attribution** | Dormant legacy contour; disabled by default in both SDK and backend |
 | **SKAdNetwork conversion values** (remote‑controlled via Conversion Hub) | This SDK applies the schema on‑device; schema edits in the UI need **no app release** |
 | **Revenue / trials / subscriptions / refunds** | **Apphud/S2S → TrackHub** is the permanent financial source of truth; the SDK never sends client-authored money |
 
-So: this SDK makes **installs + sessions + custom events + attribution + SKAN/AdAttributionKit + Google device
-context** work on its own. Revenue flows through Apphud; Firebase is not required.
+So: this SDK makes **installs + sessions + custom events + SKAN/AdAttributionKit + Google device
+context** work directly. User-level attribution and erasure additionally use the host app's
+authenticated backend. Revenue flows through Apphud; Firebase is not required.
 
 Google's separate `GoogleAdsOnDeviceConversion` iOS package is optional. It improves Integrated
 Conversion Measurement in privacy-restricted iOS traffic, but is not needed for the base App
@@ -38,6 +40,8 @@ Conversion API path and is not Firebase.
 - The app already exists in TrackHub with **platform = iOS** (so it has an ingest token).
 - **Apphud is already integrated** in the app (the SDK ties installs to `Apphud.userID()` so
   installs and revenue events join on the same user).
+- For user-level attribution or `forgetDevice`, an app backend authenticates the user and calls
+  TrackHub with a linked S2S connection. Its secret stays on that backend.
 - A **real device** for release QA. AdAttributionKit/SKAN postbacks are not a
   simulator-level end-to-end attribution test.
 
@@ -111,6 +115,12 @@ struct AutoClickerApp: App {
             apphudDeviceIdentifiersHandler: { idfa, idfv in
                 Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
             },
+            backendAttributionProvider: { userId, completion in
+                AppBackend.fetchTrackHubAttribution(userId: userId, completion: completion)
+            },
+            backendPrivacyErasureHandler: { userId, reason, completion in
+                AppBackend.eraseTrackHubUser(userId: userId, reason: reason, completion: completion)
+            },
             apphudAttributionHandler: { data, completion in
                 Apphud.setAttribution(
                     data: ApphudAttributionData(rawData: data),
@@ -159,6 +169,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             apphudDeviceIdentifiersHandler: { idfa, idfv in
                 Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
             },
+            backendAttributionProvider: { userId, completion in
+                AppBackend.fetchTrackHubAttribution(userId: userId, completion: completion)
+            },
+            backendPrivacyErasureHandler: { userId, reason, completion in
+                AppBackend.eraseTrackHubUser(userId: userId, reason: reason, completion: completion)
+            },
             apphudAttributionHandler: { data, completion in
                 Apphud.setAttribution(
                     data: ApphudAttributionData(rawData: data),
@@ -178,11 +194,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 launch. All work is async on a background queue; it never blocks the main thread.
 
 The Apphud handlers use the current official `setDeviceIdentifiers` and `setAttribution` APIs
-that Apphud documents for MMPs such as Adjust. TrackHub first resolves attribution on its server, then calls
-the handler on the main queue. The SDK persists the returned touchpoint
+that Apphud documents for MMPs such as Adjust. `AppBackend` authenticates the signed-in user,
+calls TrackHub `/sdk/attribution` with the linked S2S connection's
+`X-TrackHub-Token`, and passes the raw JSON response bytes to `completion`.
+TrackHub then calls the Apphud handler on the main queue. The SDK persists the returned touchpoint
 revision only when Apphud's callback returns `true`; network/Apphud failures
 retry after a later install/session success or `refreshApphudAttribution()`.
-The handler requires `sdkSecret`, because `/sdk/attribution` is always signed.
+Never embed or return the S2S token to the app. The app-wide `sdkSecret` cannot
+authorize attribution reads or privacy erasure because it ships in the binary.
 
 Configuration sends IDFV to Apphud immediately. Do not show ATT automatically at launch. After
 your own contextual explanation (commonly near the end of onboarding), call:
@@ -352,6 +371,7 @@ the app's data).
 | No `[TrackHub]` logs at all | `debug: true` not set, or `configure` not reached. Confirm it runs on launch. |
 | `install reported` but app page still "not detected" | Detection reads the latest install; refresh the page. If Signature is **on** server‑side but you passed no `sdkSecret`, reports are rejected — pass the secret or disable Signature. |
 | Badge shows **detected (unsigned)** | App built without `sdkSecret` while Signature is on. Add the secret and rebuild. |
+| `attribution fetch requires backendAttributionProvider` | Supply a provider that calls your authenticated app backend. That backend calls TrackHub with a linked S2S token; never put the token in the app. |
 | Legacy ASA attribution is absent | Expected by default. Re-enable both SDK `enableLegacyAsaAttribution` and backend `ENABLE_LEGACY_ASA_PROCESSING` only for an intentional rollback. |
 | `track(…) before schema is available` | Called before the first schema fetch finished; harmless — the next launch caches the schema. Schema also persists across launches once fetched. |
 
@@ -365,8 +385,9 @@ the app's data).
   retries next launch.
 - **Every launch:** `GET /ingest/{token}/cv-schema` refreshes and caches the active conversion
   schema, so Conversion Hub edits reach devices without an app release.
-- **Apphud attribution:** signed `POST /ingest/{token}/sdk/attribution` returns the selected
-  touchpoint without raw click IDs. The SDK passes it to Apphud as provider `.custom` and
+- **Apphud attribution:** the authenticated host backend calls
+  `POST /ingest/{token}/sdk/attribution` with its S2S token and returns the selected touchpoint
+  without raw click IDs. The SDK passes it to Apphud as provider `.custom` and
   suppresses a revision only after Apphud acknowledges it.
 - **`track`:** encodes the event via the schema (fine 0–63 + SKAN 4 coarse + optional window
   lock) and applies it with the richest API the OS supports (iOS 16.1+ fine+coarse+lock, 15.4+

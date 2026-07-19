@@ -45,16 +45,22 @@ TrackHub.setGoogleAdsConsent(
 // )
 
 // On app launch (e.g. in AppDelegate / @main init), after Apphud starts.
-// Copy the exact values (incl. sdkSecret) from the app's page in TrackHub →
-// SDK integration.
+// Copy the app values from TrackHub → SDK integration. AppBackend below is
+// your authenticated API; it keeps the TrackHub S2S secret off the device.
 TrackHub.configure(
     endpoint: URL(string: "https://postbacks.example.com")!, // your ingest domain
     ingestToken: "<app ingest token from the TrackHub app page>",
     userId: Apphud.userID(),         // same custom user id in both SDKs
-    sdkSecret: "<app sdk secret>",   // required for purchase + Apphud bridges
+    sdkSecret: "<app sdk secret>",   // ordinary signed measurement + purchase context
     attConsentWaitingInterval: 120,  // first install waits for ATT, hard cap 360s
     apphudDeviceIdentifiersHandler: { idfa, idfv in
         Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
+    },
+    backendAttributionProvider: { userId, completion in
+        AppBackend.fetchTrackHubAttribution(userId: userId, completion: completion)
+    },
+    backendPrivacyErasureHandler: { userId, reason, completion in
+        AppBackend.eraseTrackHubUser(userId: userId, reason: reason, completion: completion)
     },
     apphudAttributionHandler: { data, completion in
         Apphud.setAttribution(
@@ -67,10 +73,6 @@ TrackHub.configure(
     attributionChangedHandler: { attribution in
         // Update app routing/UI when a delayed click or reattribution wins.
         print(attribution.network, attribution.campaignId ?? "organic")
-    },
-    deferredDeepLinkHandler: { path in
-        // Route the one-time TrackHub measurement-link destination.
-        if let path { route(to: path) }
     }
 )
 
@@ -95,6 +97,17 @@ TrackHub.trackPurchaseObserved(
     productId: transaction.productID
 )
 ```
+
+`AppBackend` must authenticate the signed-in user, call TrackHub's
+`/sdk/attribution` or `/sdk/forget-device` endpoint with the linked S2S
+connection's `X-TrackHub-Token`, and return the attribution response bytes or
+erasure success. Never return that S2S token to the app. Without these backend
+callbacks, attribution reads and `forgetDevice` fail closed; ordinary install,
+session, event and conversion-value measurement continues.
+
+Owned-media deferred paths currently use Google Play Install Referrer on
+Android. iOS intentionally receives no probabilistic IP/UA fallback until a
+deterministic App Store hand-off is available.
 
 Apple Search Ads/AdServices collection is legacy and disabled by default. Do
 not pass `enableLegacyAsaAttribution: true` unless the TrackHub backend has also

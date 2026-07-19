@@ -60,6 +60,23 @@ public struct TrackHubAttribution: Sendable, Equatable {
 public typealias TrackHubAttributionChangedHandler = (TrackHubAttribution) -> Void
 public typealias TrackHubDeferredDeepLinkHandler = (String?) -> Void
 
+/// Supplies the raw TrackHub attribution JSON through the host app's trusted
+/// backend. That backend authenticates to `/sdk/attribution` with its linked
+/// S2S secret; the secret must never be embedded in the mobile app.
+public typealias TrackHubBackendAttributionProvider = (
+    _ userId: String,
+    _ completion: @escaping (Data?) -> Void
+) -> Void
+
+/// Requests privacy erasure through the host app's trusted backend. The
+/// backend calls `/sdk/forget-device` with its linked S2S secret and reports
+/// whether TrackHub accepted the erasure.
+public typealias TrackHubBackendPrivacyErasureHandler = (
+    _ userId: String,
+    _ reason: String,
+    _ completion: @escaping (Bool) -> Void
+) -> Void
+
 public enum TrackHubTrackingAuthorizationStatus: String, Sendable, Equatable {
     case notDetermined
     case restricted
@@ -102,7 +119,6 @@ public enum TrackHub {
     private static var apphudAttributionFetchInFlight = false
     private static var currentAttributionSnapshot: TrackHubAttribution?
     private static var attributionCompletions: [(TrackHubAttribution?) -> Void] = []
-    private static var deferredResolveInFlight = false
     private static var trackingDisabled = false
     private static var attConsentDelayActive = false
     private static var attConsentDelayWorkItem: DispatchWorkItem?
@@ -119,6 +135,8 @@ public enum TrackHub {
         let attConsentWaitingInterval: TimeInterval
         let legacyAsaAttributionEnabled: Bool
         let apphudDeviceIdentifiersHandler: ApphudDeviceIdentifiersHandler?
+        let backendAttributionProvider: TrackHubBackendAttributionProvider?
+        let backendPrivacyErasureHandler: TrackHubBackendPrivacyErasureHandler?
         let apphudAttributionHandler: ApphudAttributionHandler?
         let attributionChangedHandler: TrackHubAttributionChangedHandler?
         let deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
@@ -146,7 +164,6 @@ public enum TrackHub {
     private static let adsMeasurementConsentKey = "trackhub.consent.ads_measurement"
     private static let adAttributionConversionTagKey = "trackhub.ad_attribution.conversion_tag"
     private static let apphudAttributionRevisionKeyPrefix = "trackhub.apphud_attribution_revision."
-    private static let deferredResolveKeyPrefix = "trackhub.deferred_resolve."
     private static let privacyDisabledKeyPrefix = "trackhub.privacy_disabled."
     private static let iso8601 = ISO8601DateFormatter()
 
@@ -169,6 +186,8 @@ public enum TrackHub {
         attConsentWaitingInterval: TimeInterval = 0,
         enableLegacyAsaAttribution: Bool = false,
         apphudDeviceIdentifiersHandler: ApphudDeviceIdentifiersHandler? = nil,
+        backendAttributionProvider: TrackHubBackendAttributionProvider? = nil,
+        backendPrivacyErasureHandler: TrackHubBackendPrivacyErasureHandler? = nil,
         apphudAttributionHandler: ApphudAttributionHandler? = nil,
         attributionChangedHandler: TrackHubAttributionChangedHandler? = nil,
         deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = nil
@@ -189,6 +208,8 @@ public enum TrackHub {
                 attConsentWaitingInterval: normalizedATTConsentWaitingInterval(attConsentWaitingInterval),
                 legacyAsaAttributionEnabled: enableLegacyAsaAttribution,
                 apphudDeviceIdentifiersHandler: apphudDeviceIdentifiersHandler,
+                backendAttributionProvider: backendAttributionProvider,
+                backendPrivacyErasureHandler: backendPrivacyErasureHandler,
                 apphudAttributionHandler: apphudAttributionHandler,
                 attributionChangedHandler: attributionChangedHandler,
                 deferredDeepLinkHandler: deferredDeepLinkHandler
@@ -290,33 +311,32 @@ public enum TrackHub {
         queue.async { resolveDeferredDeepLinkIfNeeded(completion: completion) }
     }
 
-    /// Permanently erases this app/user identity on TrackHub and disables all
-    /// subsequent SDK delivery for the current ingest token on this install.
+    /// Permanently erases this app/user identity through the host app's trusted
+    /// backend and disables subsequent SDK delivery for this install only after
+    /// the backend confirms TrackHub accepted the request.
     public static func forgetDevice(
         reason: String = "user_requested",
         completion: ((Bool) -> Void)? = nil
     ) {
         queue.async {
-            guard let config, config.sdkSecret?.isEmpty == false else {
+            guard let config, let handler = config.backendPrivacyErasureHandler else {
+                log("forget-device requires backendPrivacyErasureHandler")
                 return DispatchQueue.main.async { completion?(false) }
             }
             let boundedReason = String(reason.prefix(256))
-            let body: [String: Any] = ["user_id": config.userId, "reason": boundedReason]
-            guard let data = try? JSONSerialization.data(withJSONObject: body) else {
-                return DispatchQueue.main.async { completion?(false) }
-            }
-            postRawResponse(path: "sdk/forget-device", bodyData: data) { status, _ in
-                queue.async {
-                    let accepted = isSuccess(status)
-                    if accepted {
-                        trackingDisabled = true
-                        UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
-                        currentAttributionSnapshot = nil
-                        UserDefaults.standard.removeObject(forKey: pushTokenKey)
-                        UserDefaults.standard.removeObject(forKey: pushEnvironmentKey)
-                        for report in eventQueue?.items ?? [] { eventQueue?.remove(id: report.id) }
+            DispatchQueue.main.async {
+                handler(config.userId, boundedReason) { accepted in
+                    queue.async {
+                        if accepted {
+                            trackingDisabled = true
+                            UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
+                            currentAttributionSnapshot = nil
+                            UserDefaults.standard.removeObject(forKey: pushTokenKey)
+                            UserDefaults.standard.removeObject(forKey: pushEnvironmentKey)
+                            for report in eventQueue?.items ?? [] { eventQueue?.remove(id: report.id) }
+                        }
+                        DispatchQueue.main.async { completion?(accepted) }
                     }
-                    DispatchQueue.main.async { completion?(accepted) }
                 }
             }
         }
@@ -1058,70 +1078,61 @@ public enum TrackHub {
             finishAttributionCompletions(nil)
             return
         }
-        guard config.sdkSecret?.isEmpty == false else {
+        guard let provider = config.backendAttributionProvider else {
             finishAttributionCompletions(nil)
-            return log("attribution fetch requires sdkSecret")
+            return log("attribution fetch requires backendAttributionProvider")
         }
-        let body: [String: Any] = [
-            "user_id": config.userId,
-            "event_at": iso8601.string(from: Date()),
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
         apphudAttributionFetchInFlight = true
-        postRawResponse(path: "sdk/attribution", bodyData: data) { status, responseData in
-            queue.async {
-                apphudAttributionFetchInFlight = false
-                guard isSuccess(status), let responseData,
-                      let envelope = try? JSONDecoder().decode(ApphudAttributionEnvelope.self, from: responseData),
-                      envelope.ok, let snapshot = envelope.attribution,
-                      snapshot.provider == "custom" else {
-                    finishAttributionCompletions(nil)
-                    if isRetryable(status) { log("attribution fetch failed — will retry") }
-                    return
-                }
-                let resolved = attribution(from: snapshot)
-                let changed = currentAttributionSnapshot?.revision != resolved.revision
-                currentAttributionSnapshot = resolved
-                finishAttributionCompletions(resolved)
-                if changed, let handler = config.attributionChangedHandler {
-                    DispatchQueue.main.async { handler(resolved) }
-                }
-                guard let handler = config.apphudAttributionHandler,
-                      shouldDeliverApphudAttribution(
-                    revision: snapshot.revision,
-                    userId: config.userId
-                ) else { return }
-                DispatchQueue.main.async {
-                    handler(snapshot.data) { accepted in
-                        queue.async {
-                            if accepted {
-                                markApphudAttributionDelivered(
-                                    revision: snapshot.revision,
-                                    userId: config.userId
-                                )
-                                log("Apphud attribution revision \(snapshot.revision) delivered")
-                            } else {
-                                log("Apphud rejected attribution — will retry")
+        DispatchQueue.main.async {
+            provider(config.userId) { responseData in
+                queue.async {
+                    apphudAttributionFetchInFlight = false
+                    guard let responseData,
+                          let envelope = try? JSONDecoder().decode(ApphudAttributionEnvelope.self, from: responseData),
+                          envelope.ok else {
+                        finishAttributionCompletions(nil)
+                        log("backend attribution fetch failed — will retry")
+                        return
+                    }
+                    guard let snapshot = envelope.attribution else {
+                        finishAttributionCompletions(nil)
+                        return
+                    }
+                    guard snapshot.provider == "custom" else {
+                        finishAttributionCompletions(nil)
+                        log("backend returned an invalid attribution provider")
+                        return
+                    }
+                    let resolved = attribution(from: snapshot)
+                    let changed = currentAttributionSnapshot?.revision != resolved.revision
+                    currentAttributionSnapshot = resolved
+                    finishAttributionCompletions(resolved)
+                    if changed, let handler = config.attributionChangedHandler {
+                        DispatchQueue.main.async { handler(resolved) }
+                    }
+                    guard let handler = config.apphudAttributionHandler,
+                          shouldDeliverApphudAttribution(
+                            revision: snapshot.revision,
+                            userId: config.userId
+                          ) else { return }
+                    DispatchQueue.main.async {
+                        handler(snapshot.data) { accepted in
+                            queue.async {
+                                if accepted {
+                                    markApphudAttributionDelivered(
+                                        revision: snapshot.revision,
+                                        userId: config.userId
+                                    )
+                                    log("Apphud attribution revision \(snapshot.revision) delivered")
+                                } else {
+                                    log("Apphud rejected attribution — will retry")
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
-
-    private struct DeferredDeepLinkEnvelope: Decodable {
-        let deepLinkPath: String?
-
-        private enum CodingKeys: String, CodingKey {
-            case deepLinkPath = "deep_link_path"
-        }
-    }
-
-    private static func deferredResolveKey(token: String) -> String {
-        let digest = SHA256.hash(data: Data(token.utf8))
-        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
-        return deferredResolveKeyPrefix + suffix
     }
 
     private static func privacyDisabledKey(token: String) -> String {
@@ -1133,40 +1144,15 @@ public enum TrackHub {
     private static func resolveDeferredDeepLinkIfNeeded(
         completion: TrackHubDeferredDeepLinkHandler? = nil
     ) {
-        guard !trackingDisabled else {
-            if let completion { DispatchQueue.main.async { completion(nil) } }
-            return
-        }
-        guard !deferredResolveInFlight, let config, config.integrationTestToken == nil else {
-            if let completion { DispatchQueue.main.async { completion(nil) } }
-            return
-        }
-        let handler = completion ?? config.deferredDeepLinkHandler
+        let handler = completion ?? config?.deferredDeepLinkHandler
         guard let handler else { return }
-        let resolvedKey = deferredResolveKey(token: config.ingestToken)
-        if UserDefaults.standard.bool(forKey: resolvedKey) {
-            if completion != nil { DispatchQueue.main.async { handler(nil) } }
-            return
-        }
-        let url = config.endpoint
-            .appendingPathComponent("ingest")
-            .appendingPathComponent(config.ingestToken)
-            .appendingPathComponent("resolve")
-        deferredResolveInFlight = true
-        URLSession.shared.dataTask(with: url) { data, response, _ in
-            queue.async {
-                deferredResolveInFlight = false
-                guard let http = response as? HTTPURLResponse,
-                      http.statusCode == 200,
-                      let data,
-                      let envelope = try? JSONDecoder().decode(DeferredDeepLinkEnvelope.self, from: data) else {
-                    DispatchQueue.main.async { handler(nil) }
-                    return
-                }
-                UserDefaults.standard.set(true, forKey: resolvedKey)
-                DispatchQueue.main.async { handler(envelope.deepLinkPath) }
-            }
-        }.resume()
+        // The App Store does not provide an Android Install-Referrer-style
+        // channel for carrying TrackHub's one-time match capability from the
+        // browser into a fresh app install. Never substitute IP/UA correlation
+        // as authorization for a user-specific path. Keep the public API
+        // source-compatible and fail closed until a deterministic iOS handoff
+        // (for example, an approved first-party universal-link flow) exists.
+        DispatchQueue.main.async { handler(nil) }
     }
 
     // MARK: - Offline buffer + networking

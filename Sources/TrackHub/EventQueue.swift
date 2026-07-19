@@ -45,6 +45,16 @@ import Foundation
     }
 
     private func persist() {
-        if let data = try? JSONEncoder().encode(items) { try? data.write(to: url, options: .atomic) }
+        guard let data = try? JSONEncoder().encode(items) else { return }
+        try? data.write(to: url, options: .atomic)
+        #if os(iOS)
+        // Buffered event parameters can be user data. Make their at-rest
+        // protection explicit instead of relying on the embedding app's
+        // default file-protection class.
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: url.path
+        )
+        #endif
     }
 }
