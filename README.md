@@ -52,6 +52,7 @@ TrackHub.configure(
     ingestToken: "<app ingest token from the TrackHub app page>",
     userId: Apphud.userID(),         // same custom user id in both SDKs
     sdkSecret: "<app sdk secret>",   // ordinary signed measurement + purchase context
+    countryCode: measurementCountry, // actual ISO-3166 country, not UI language
     attConsentWaitingInterval: 120,  // first install waits for ATT, hard cap 360s
     apphudDeviceIdentifiersHandler: { idfa, idfv in
         Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
@@ -237,8 +238,9 @@ What happens under the hood:
   that deliberately keep GA4 forwarding alongside the App Conversion API.
 - Google's standalone iOS On-Device Conversion Measurement package is optional. When used,
   pass its opaque info string before `configure`; TrackHub never interprets it.
-- The SDK persists one `first_open_at` timestamp and sends ISO country/device context on every
-  post-install report, so Google's required `fot`/`ctry_c` fields survive install/session races.
+- The SDK persists one `first_open_at` timestamp and device context on every post-install report.
+  Supply the actual ISO country through `countryCode` (or configure TrackHub's trusted edge geo
+  header); the SDK deliberately does not mislabel Locale/language as geography.
 - For mainland-China traffic, call `setPIPLConsent` after your consent UI; denied or missing
   cross-border/ads-measurement consent then blocks Google delivery fail-closed.
 - Legacy AdServices collection remains available only through the explicit

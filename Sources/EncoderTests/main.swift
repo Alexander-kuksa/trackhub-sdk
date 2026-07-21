@@ -79,6 +79,11 @@ let sigHex = sigMac.map { String(format: "%02x", $0) }.joined()
 check(sigHex == "48bd3ea5529853b246d18a578d1ce79aa50c2d3e7f69663b233bd696c5c8a91d",
       "SDK signature HMAC matches the server vector")
 
+check(TrackHub.normalizedCountryCode(" de ") == "DE",
+      "explicit country code is normalized to ISO uppercase")
+check(TrackHub.normalizedCountryCode("XX") == nil && TrackHub.normalizedCountryCode("Europe") == nil,
+      "unknown and non-ISO country values are rejected")
+
 // ── Session coalescing (60s timeout, monotonic sequence) ──────────────────────
 let suiteName = "trackhub.parity.session"
 let suite = UserDefaults(suiteName: suiteName)!

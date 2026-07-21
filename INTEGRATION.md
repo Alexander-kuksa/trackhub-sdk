@@ -110,6 +110,7 @@ struct AutoClickerApp: App {
             ingestToken: "<app ingest token>",
             userId: Apphud.userID(),
             sdkSecret: "<app sdk secret>",          // omit this line if Signature is off
+            countryCode: measurementCountry,        // actual ISO country, not UI language
             attConsentWaitingInterval: 120,          // 0=off; maximum 360 seconds
             // debug: true,                          // uncomment while testing
             apphudDeviceIdentifiersHandler: { idfa, idfv in
@@ -337,6 +338,7 @@ TrackHub.configure(
     ingestToken: "<app token>",
     userId: Apphud.userID(),
     sdkSecret: "<SDK secret>",
+    countryCode: measurementCountry,
     debug: true,
     integrationTestToken: "<short-lived Test Lab run token>"
 )

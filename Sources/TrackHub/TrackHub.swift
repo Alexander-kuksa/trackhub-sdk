@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(Darwin)
+import Darwin
+#endif
 #if canImport(StoreKit)
 import StoreKit
 #endif
@@ -159,6 +162,7 @@ public enum TrackHub {
     private static let adUserDataKey = "trackhub.consent.ad_user_data"
     private static let adPersonalizationKey = "trackhub.consent.ad_personalization"
     private static let eeaKey = "trackhub.consent.eea"
+    private static let countryCodeKey = "trackhub.country_code"
     private static let piplConsentKey = "trackhub.consent.pipl"
     private static let crossBorderTransferConsentKey = "trackhub.consent.cross_border_transfer"
     private static let adsMeasurementConsentKey = "trackhub.consent.ads_measurement"
@@ -181,6 +185,7 @@ public enum TrackHub {
         sdkSecret: String? = nil,
         firebaseAppInstanceId: String? = nil,
         googleOnDeviceMeasurementInfo: String? = nil,
+        countryCode: String? = nil,
         debug: Bool = false,
         integrationTestToken: String? = nil,
         attConsentWaitingInterval: TimeInterval = 0,
@@ -227,6 +232,9 @@ public enum TrackHub {
             }
             if let info = boundedOdmInfo(googleOnDeviceMeasurementInfo) {
                 UserDefaults.standard.set(info, forKey: odmInfoKey)
+            }
+            if let country = normalizedCountryCode(countryCode) {
+                UserDefaults.standard.set(country, forKey: countryCodeKey)
             }
             _ = resolveFirstOpenAt()
             schema = loadCachedSchema()
@@ -331,8 +339,13 @@ public enum TrackHub {
                             trackingDisabled = true
                             UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
                             currentAttributionSnapshot = nil
-                            UserDefaults.standard.removeObject(forKey: pushTokenKey)
-                            UserDefaults.standard.removeObject(forKey: pushEnvironmentKey)
+                            for key in [
+                                pushTokenKey, pushEnvironmentKey, deviceIdKey, installUidKey,
+                                gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
+                                appInstanceIdKey, odmInfoKey,
+                            ] {
+                                UserDefaults.standard.removeObject(forKey: key)
+                            }
                             for report in eventQueue?.items ?? [] { eventQueue?.remove(id: report.id) }
                         }
                         DispatchQueue.main.async { completion?(accepted) }
@@ -477,6 +490,15 @@ public enum TrackHub {
         UserDefaults.standard.set(value, forKey: odmInfoKey)
     }
 
+    /// Set the actual ISO-3166 country where measurement originates. Do not
+    /// derive this from the device language/Locale: a user can travel or choose
+    /// a language unrelated to their current country. A trusted server edge may
+    /// override this value from its geo header.
+    public static func setCountryCode(_ countryCode: String) {
+        guard let value = normalizedCountryCode(countryCode) else { return }
+        UserDefaults.standard.set(value, forKey: countryCodeKey)
+    }
+
     /// Stable first-launch timestamp for Google's standalone on-device
     /// measurement SDK. Safe to read before `configure(...)`.
     public static var firstOpenAt: Date { resolveFirstOpenAt() }
@@ -607,15 +629,11 @@ public enum TrackHub {
                 "occurred_at": iso8601.string(from: Date()),
                 "first_open_at": iso8601.string(from: resolveFirstOpenAt()),
                 "sdk_version": Self.sdkVersion,
-                "os_version": ProcessInfo.processInfo.operatingSystemVersionString,
-                "locale": Locale.current.identifier,
             ]
+            appendAppConversionUserAgentContext(to: &body)
             if let country = currentCountryCode() { body["country"] = country }
             if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
                 body["app_version"] = version
-            }
-            if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
-                body["build"] = build
             }
             appendOdmInfo(to: &body)
             appendAppConversionDeviceIdentifier(to: &body)
@@ -761,14 +779,12 @@ public enum TrackHub {
             "occurred_at": iso8601.string(from: occurredAt),
             "first_open_at": iso8601.string(from: firstOpenAt ?? resolveFirstOpenAt()),
             "sdk_version": Self.sdkVersion,
-            "locale": Locale.current.identifier,
-            "os_version": ProcessInfo.processInfo.operatingSystemVersionString,
         ]
+        appendAppConversionUserAgentContext(to: &body)
         if let productId, !productId.isEmpty { body["product_id"] = productId }
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
             body["app_version"] = v
         }
-        if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String { body["build"] = b }
         if let country = currentCountryCode() { body["country"] = country }
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
@@ -840,12 +856,10 @@ public enum TrackHub {
             "started_at": iso8601.string(from: started.startedAt),
             "first_open_at": iso8601.string(from: resolveFirstOpenAt()),
             "sdk_version": Self.sdkVersion,
-            "locale": Locale.current.identifier,
         ]
+        appendAppConversionUserAgentContext(to: &body)
         if let country = currentCountryCode() { body["country"] = country }
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String { body["app_version"] = v }
-        if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String { body["build"] = b }
-        body["os_version"] = ProcessInfo.processInfo.operatingSystemVersionString
         let defaults = UserDefaults.standard
         if let gclid = defaults.string(forKey: pendingGclidKey) { body["gclid"] = gclid }
         if let gbraid = defaults.string(forKey: pendingGbraidKey) { body["gbraid"] = gbraid }
@@ -880,10 +894,8 @@ public enum TrackHub {
         body["platform"] = "ios"
         #endif
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String { body["app_version"] = v }
-        body["os_version"] = ProcessInfo.processInfo.operatingSystemVersionString
-        body["locale"] = Locale.current.identifier
+        appendAppConversionUserAgentContext(to: &body)
         if let country = currentCountryCode() { body["country"] = country }
-        if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String { body["build"] = b }
         body["occurred_at"] = iso8601.string(from: resolveFirstOpenAt())
         if config.legacyAsaAttributionEnabled,
            let token = SKANUpdater.attributionToken() {
@@ -1251,15 +1263,43 @@ public enum TrackHub {
         return date
     }
 
+    @_spi(Testing) public static func normalizedCountryCode(_ raw: String?) -> String? {
+        guard let value = raw?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased(),
+            value.count == 2,
+            value != "XX",
+            value.unicodeScalars.allSatisfy({ $0.value >= 65 && $0.value <= 90 })
+        else { return nil }
+        return value
+    }
+
     private static func currentCountryCode() -> String? {
-        let code: String?
-        if #available(iOS 16.0, macOS 13.0, *) {
-            code = Locale.current.region?.identifier
-        } else {
-            code = Locale.current.regionCode
-        }
-        guard let code, code.count == 2 else { return nil }
-        return code.uppercased()
+        normalizedCountryCode(UserDefaults.standard.string(forKey: countryCodeKey))
+    }
+
+    private static func appendAppConversionUserAgentContext(to body: inout [String: Any]) {
+        #if os(iOS)
+        body["os_version"] = UIDevice.current.systemVersion
+        #else
+        body["os_version"] = ProcessInfo.processInfo.operatingSystemVersionString
+        #endif
+        body["locale"] = Locale.current.identifier.replacingOccurrences(of: "-", with: "_")
+        if let model = systemValue("hw.machine") { body["device_model"] = model }
+        if let build = systemValue("kern.osversion") { body["build"] = build }
+    }
+
+    private static func systemValue(_ name: String) -> String? {
+        #if canImport(Darwin)
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 1 else { return nil }
+        var value = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &value, &size, nil, 0) == 0 else { return nil }
+        let result = String(cString: value).trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty ? nil : result
+        #else
+        return nil
+        #endif
     }
 
     private static func boundedOdmInfo(_ raw: String?) -> String? {
@@ -1283,11 +1323,14 @@ public enum TrackHub {
             body["device_id_type"] = "idfa"
             body["limit_ad_tracking"] = false
         } else if let idfv = UIDevice.current.identifierForVendor?.uuidString {
-            // Google documents IDFV as the limited-tracking iOS fallback when
-            // IDFA is unavailable or ATT was not authorized.
+            // ID type and LAT are independent in Google's v1.1 contract.
             body["device_id"] = idfv
             body["device_id_type"] = "idfv"
-            body["limit_ad_tracking"] = true
+            #if canImport(AppTrackingTransparency)
+            body["limit_ad_tracking"] = ATTrackingManager.trackingAuthorizationStatus != .authorized
+            #else
+            body["limit_ad_tracking"] = false
+            #endif
         }
         #endif
     }
