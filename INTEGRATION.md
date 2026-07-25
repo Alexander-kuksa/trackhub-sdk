@@ -51,12 +51,12 @@ Conversion API path and is not Firebase.
 
 **Xcode:** *File → Add Package Dependencies…* →
 `https://github.com/Alexander-kuksa/trackhub-sdk` → Dependency Rule: **Up to Next Major** from
-`1.9.0` → add the **`TrackHub`** library to your app target.
+`1.10.0` → add the **`TrackHub`** library to your app target.
 
 Or in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.9.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.0")
 // …and in the target's dependencies:
 .product(name: "TrackHub", package: "trackhub-sdk")
 ```

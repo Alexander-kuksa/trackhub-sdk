@@ -182,6 +182,19 @@ check(wb.wbraid == "WB9" && wb.gclid == nil && wb.gbraid == nil, "parses wbraid 
 let none = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?foo=bar&gbraid=")!)
 check(none.gclid == nil && none.gbraid == nil && none.wbraid == nil, "empty / absent click ids are treated as nil")
 
+let openAiOppref = TrackHub.parseOpenAiOppref(
+    from: URL(string: "myapp://open?oppref=%20OpenAI-Click-123%20")!
+)
+check(openAiOppref == "OpenAI-Click-123", "parses and trims the OpenAI Ads oppref")
+let emptyOpenAiOppref = TrackHub.parseOpenAiOppref(
+    from: URL(string: "myapp://open?oppref=%20%20")!
+)
+check(emptyOpenAiOppref == nil, "empty OpenAI Ads oppref is treated as nil")
+let oversizedOpenAiOppref = TrackHub.parseOpenAiOppref(
+    from: URL(string: "myapp://open?oppref=\(String(repeating: "x", count: 1025))")!
+)
+check(oversizedOpenAiOppref == nil, "oversized OpenAI Ads oppref is rejected")
+
 let reengagementTag = TrackHub.parseAdAttributionReengagementConversionTag(
     from: URL(string: "https://app.example.com/offer?AdAttributionKitReengagementOpen=tag-123")!
 )

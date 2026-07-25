@@ -9,18 +9,18 @@ remote-controlled SKAdNetwork and AdAttributionKit conversion values
 
 > **Build status.** GitHub Actions (`.github/workflows/ios-ci.yml`) builds the Swift package,
 > runs the executable contract suite and compiles the library for a generic iOS Simulator on
-> every push and pull request. The source below requires the `1.9.0` release tag to be published
+> every push and pull request. The source below requires the `1.10.0` release tag to be published
 > before consumer apps can resolve that version.
 
 ## Install
 
 Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
-Dependency Rule: Up to Next Major `1.9.0`. iOS 14+, no third-party dependencies.
+Dependency Rule: Up to Next Major `1.10.0`. iOS 14+, no third-party dependencies.
 
 Swift Package Manager (`Package.swift`):
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.9.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.0")
 ```
 
 ## Usage
@@ -136,16 +136,16 @@ TrackHub.trackEvent(
 iOS 17.4 supports base AdAttributionKit updates, iOS 18 adds install/re-engagement targeting, and
 iOS 18.4 adds conversion tags. Older systems keep the SKAdNetwork fallback.
 
-### iOS Google Ads attribution (gclid / gbraid)
+### iOS ad-network attribution (Google Ads / ChatGPT Ads)
 
-When a Google Ads deep link carries `gclid` and/or `gbraid`, forward it to TrackHub. On a cold
+When a deep link carries Google `gclid`/`gbraid` or OpenAI Ads `oppref`, forward it to TrackHub. On a cold
 launch call this **before** `configure(...)`; on an already-running app the SDK immediately forces
-a new `session_start`. TrackHub caches the click server-side for downstream App Conversion events.
+a new `session_start`. TrackHub caches the reference server-side for downstream conversion events.
 `wbraid` is retained for the separate web/offline conversion contour:
 
 ```swift
 // In your URL handler — and, on a cold launch from a click, the launch URL:
-TrackHub.handleDeepLink(url)            // pulls gclid / gbraid / wbraid
+TrackHub.handleDeepLink(url)            // pulls gclid / gbraid / wbraid / oppref
 // …or set it directly if you obtained the id another way:
 TrackHub.setGoogleClickId(gclid: "…", gbraid: "…")
 

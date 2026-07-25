@@ -111,7 +111,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.9.0"
+    public static let sdkVersion = "1.10.0"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -157,6 +157,8 @@ public enum TrackHub {
     private static let wbraidKey = "trackhub.wbraid"
     private static let pendingGclidKey = "trackhub.pending_gclid"
     private static let pendingGbraidKey = "trackhub.pending_gbraid"
+    private static let openAiOpprefKey = "trackhub.openai_oppref"
+    private static let pendingOpenAiOpprefKey = "trackhub.pending_openai_oppref"
     private static let appInstanceIdKey = "trackhub.app_instance_id"
     private static let odmInfoKey = "trackhub.google_odm_info"
     private static let adUserDataKey = "trackhub.consent.ad_user_data"
@@ -342,6 +344,7 @@ public enum TrackHub {
                             for key in [
                                 pushTokenKey, pushEnvironmentKey, deviceIdKey, installUidKey,
                                 gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
+                                openAiOpprefKey, pendingOpenAiOpprefKey,
                                 appInstanceIdKey, odmInfoKey,
                             ] {
                                 UserDefaults.standard.removeObject(forKey: key)
@@ -554,18 +557,33 @@ public enum TrackHub {
         if let w = wbraid, !w.isEmpty { UserDefaults.standard.set(w, forKey: wbraidKey) }
     }
 
-    /// Convenience over `setGoogleClickId`: extracts `gclid` / `gbraid` / `wbraid` from a
-    /// deep-link / universal-link URL's query and stores them. Returns true if a
-    /// Google click id was found. Call from your URL handler and, on a cold launch
-    /// from a click, from the launch URL — before `configure(...)`.
+    /// Captures supported ad click references from a deep/universal link:
+    /// Google `gclid`/`gbraid`/`wbraid` and OpenAI Ads `oppref`.
     @discardableResult
     public static func handleDeepLink(_ url: URL) -> Bool {
         let ids = parseGoogleClickIds(from: url)
-        guard ids.gclid != nil || ids.gbraid != nil || ids.wbraid != nil else { return false }
+        let oppref = parseOpenAiOppref(from: url)
+        guard ids.gclid != nil || ids.gbraid != nil || ids.wbraid != nil || oppref != nil else {
+            return false
+        }
         // Store first, then force exactly one session below. Calling the public
         // setter here would schedule a second forced session.
         storeGoogleClickIds(gclid: ids.gclid, gbraid: ids.gbraid, wbraid: ids.wbraid)
-        if ids.gclid != nil || ids.gbraid != nil {
+        let defaults = UserDefaults.standard
+        let hasGoogleReference = ids.gclid != nil || ids.gbraid != nil || ids.wbraid != nil
+        if oppref != nil && !hasGoogleReference {
+            for key in [gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey] {
+                defaults.removeObject(forKey: key)
+            }
+        } else if hasGoogleReference && oppref == nil {
+            defaults.removeObject(forKey: openAiOpprefKey)
+            defaults.removeObject(forKey: pendingOpenAiOpprefKey)
+        }
+        if let oppref {
+            defaults.set(oppref, forKey: openAiOpprefKey)
+            defaults.set(oppref, forKey: pendingOpenAiOpprefKey)
+        }
+        if ids.gclid != nil || ids.gbraid != nil || oppref != nil {
             queue.async {
                 if config != nil { handleForeground(force: true) }
             }
@@ -607,6 +625,16 @@ public enum TrackHub {
             return (v?.isEmpty == false) ? v : nil
         }
         return (value("gclid"), value("gbraid"), value("wbraid"))
+    }
+
+    @_spi(Testing) public static func parseOpenAiOppref(from url: URL) -> String? {
+        let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "oppref" })?
+            .value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty, value.count <= 1024 else { return nil }
+        return value
     }
 
     /// Tracks a non-financial engagement event → TrackHub analytics and applies
@@ -863,8 +891,12 @@ public enum TrackHub {
         let defaults = UserDefaults.standard
         if let gclid = defaults.string(forKey: pendingGclidKey) { body["gclid"] = gclid }
         if let gbraid = defaults.string(forKey: pendingGbraidKey) { body["gbraid"] = gbraid }
+        if let oppref = defaults.string(forKey: pendingOpenAiOpprefKey) {
+            body["oppref"] = oppref
+        }
         defaults.removeObject(forKey: pendingGclidKey)
         defaults.removeObject(forKey: pendingGbraidKey)
+        defaults.removeObject(forKey: pendingOpenAiOpprefKey)
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
         send(path: "sdk/session", body: body) { status in
@@ -907,6 +939,9 @@ public enum TrackHub {
         if let c = UserDefaults.standard.string(forKey: gclidKey) { body["gclid"] = c }
         if let g = UserDefaults.standard.string(forKey: gbraidKey) { body["gbraid"] = g }
         if let w = UserDefaults.standard.string(forKey: wbraidKey) { body["wbraid"] = w }
+        if let oppref = UserDefaults.standard.string(forKey: openAiOpprefKey) {
+            body["oppref"] = oppref
+        }
         // Firebase app_instance_id (GA4 join key for server-confirmed conversions).
         if let aii = UserDefaults.standard.string(forKey: appInstanceIdKey) { body["app_instance_id"] = aii }
         appendOdmInfo(to: &body)
