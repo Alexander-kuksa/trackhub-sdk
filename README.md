@@ -202,12 +202,14 @@ sent.
 What happens under the hood:
 
 - **First launch:** one `POST /ingest/{token}/install` with the available platform attribution
-  context and any `gclid` / `gbraid` / `wbraid` set beforehand. Repeat launches are no-ops (and a failed
-  report retries next launch).
+  context and any `gclid` / `gbraid` / `wbraid` set beforehand. The report is written to the bounded
+  disk queue before delivery and retries with backoff while the app is alive and across later launches;
+  repeat launches are no-ops only after TrackHub acknowledges it.
 - **Every launch:** the active conversion value schema is fetched from
   `GET /ingest/{token}/cv-schema` and cached locally.
-- **`trackEvent(name, …)`:** sends the event to TrackHub analytics (`POST /ingest/{token}/sdk/track`,
-  buffered offline with retry) and drives both on-device Apple attribution APIs via `track()`.
+- **`trackEvent(name, …)`:** persists the event before a single delivery worker sends it to TrackHub
+  analytics (`POST /ingest/{token}/sdk/track`) with timeout/backoff, and drives both on-device Apple
+  attribution APIs via `track()`.
 - **`track(event, revenueCents:)` (attribution only, no analytics):** the event is encoded via the schema
   (fine value 0–63 with linear revenue bucketing, SKAN 4 coarse value, optional window lock) and
   applied through the best available API:

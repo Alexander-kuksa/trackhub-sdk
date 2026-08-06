@@ -119,7 +119,15 @@ public enum TrackHub {
     private static var debugLogging = false
     private static var sessionTracker: SessionTracker?
     private static var eventQueue: EventQueue?
+    private static let httpClient = BoundedHTTPClient()
+    private static var deliveryInFlight = false
+    private static var retryWorkItem: DispatchWorkItem?
+    private static var retryDeadline: Date?
+    private static var transientRetryNotBefore: Date?
+    private static var deliveryCompletions: [String: (Int?) -> Void] = [:]
     private static var apphudAttributionFetchInFlight = false
+    private static var attributionFetchGeneration: UInt64 = 0
+    private static var activeForgetRequests: Set<UUID> = []
     private static var currentAttributionSnapshot: TrackHubAttribution?
     private static var attributionCompletions: [(TrackHubAttribution?) -> Void] = []
     private static var trackingDisabled = false
@@ -143,6 +151,12 @@ public enum TrackHub {
         let apphudAttributionHandler: ApphudAttributionHandler?
         let attributionChangedHandler: TrackHubAttributionChangedHandler?
         let deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
+    }
+
+    private struct NetworkConfig {
+        let endpoint: URL
+        let ingestToken: String
+        let sdkSecret: String?
     }
 
     private static let schemaCacheKey = "trackhub.cv_schema"
@@ -172,6 +186,10 @@ public enum TrackHub {
     private static let apphudAttributionRevisionKeyPrefix = "trackhub.apphud_attribution_revision."
     private static let privacyDisabledKeyPrefix = "trackhub.privacy_disabled."
     private static let iso8601 = ISO8601DateFormatter()
+    private static let callbackTimeout: TimeInterval = 15
+    private static let maxReportBytes = EventQueue.defaultMaxItemBytes
+    private static let retryBaseInterval: TimeInterval = 1
+    private static let retryMaxInterval: TimeInterval = 5 * 60
 
     // MARK: - Public API
 
@@ -245,7 +263,11 @@ public enum TrackHub {
             // Each run gets a token-hash namespace; production keeps its stable
             // queue. Recreate on configure so switching modes cannot reuse the
             // previous in-memory queue accidentally.
-            eventQueue = EventQueue(maxItems: 1000, url: queueFileURL(testToken: config?.integrationTestToken))
+            retryWorkItem?.cancel()
+            retryWorkItem = nil
+            retryDeadline = nil
+            transientRetryNotBefore = nil
+            eventQueue = EventQueue(url: queueFileURL(testToken: config?.integrationTestToken))
             startATTConsentDelayIfNeeded()
             publishApphudDeviceIdentifiers()
             SKANUpdater.registerForAttribution()
@@ -334,26 +356,42 @@ public enum TrackHub {
                 return DispatchQueue.main.async { completion?(false) }
             }
             let boundedReason = String(reason.prefix(256))
-            DispatchQueue.main.async {
-                handler(config.userId, boundedReason) { accepted in
-                    queue.async {
-                        if accepted {
-                            trackingDisabled = true
-                            UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
-                            currentAttributionSnapshot = nil
-                            for key in [
-                                pushTokenKey, pushEnvironmentKey, deviceIdKey, installUidKey,
-                                gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
-                                openAiOpprefKey, pendingOpenAiOpprefKey,
-                                appInstanceIdKey, odmInfoKey,
-                            ] {
-                                UserDefaults.standard.removeObject(forKey: key)
-                            }
-                            for report in eventQueue?.items ?? [] { eventQueue?.remove(id: report.id) }
+            let requestID = UUID()
+            activeForgetRequests.insert(requestID)
+            let finish: (Bool) -> Void = { accepted in
+                queue.async {
+                    guard activeForgetRequests.remove(requestID) != nil else { return }
+                    if accepted {
+                        trackingDisabled = true
+                        UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
+                        currentAttributionSnapshot = nil
+                        retryWorkItem?.cancel()
+                        retryWorkItem = nil
+                        retryDeadline = nil
+                        transientRetryNotBefore = nil
+                        deliveryCompletions.removeAll()
+                        for key in [
+                            pushTokenKey, pushEnvironmentKey, deviceIdKey, installUidKey,
+                            gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
+                            openAiOpprefKey, pendingOpenAiOpprefKey,
+                            appInstanceIdKey, odmInfoKey,
+                        ] {
+                            UserDefaults.standard.removeObject(forKey: key)
                         }
-                        DispatchQueue.main.async { completion?(accepted) }
+                        if eventQueue?.removeAll() == false {
+                            log("forget-device could not erase the offline queue")
+                        }
                     }
+                    DispatchQueue.main.async { completion?(accepted) }
                 }
+            }
+            queue.asyncAfter(deadline: .now() + callbackTimeout) {
+                guard activeForgetRequests.contains(requestID) else { return }
+                log("forget-device backend timed out")
+                finish(false)
+            }
+            DispatchQueue.main.async {
+                handler(config.userId, boundedReason, finish)
             }
         }
     }
@@ -947,22 +985,12 @@ public enum TrackHub {
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
         appendConsent(to: &body)
-        if let testToken = config.integrationTestToken { body["test_run_token"] = testToken }
-
-        let data = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
-        postRaw(path: "install", bodyData: data) { status in
-            if isSuccess(status) {
-                if !isIntegrationTest { UserDefaults.standard.set(true, forKey: installSentKey) }
-                log(isIntegrationTest ? "integration-test install reported" : "install reported")
-                if !isIntegrationTest {
-                    queue.async {
-                        reportConsentUpdate()
-                        fetchAttributionIfNeeded()
-                    }
-                }
-            }
-            else { log("install report failed — will retry on next launch") }
-        }
+        send(
+            path: "install",
+            body: body,
+            kind: isIntegrationTest ? "test_install" : "production_install",
+            dedupeKey: "install"
+        )
     }
 
     private static func reportPushTokenIfAvailable() {
@@ -1034,8 +1062,10 @@ public enum TrackHub {
     private static func refreshSchema() {
         guard let config else { return }
         let url = config.endpoint.appendingPathComponent("ingest").appendingPathComponent(config.ingestToken).appendingPathComponent("cv-schema")
-        URLSession.shared.dataTask(with: url) { data, response, _ in
-            guard let data, let http = response as? HTTPURLResponse, http.statusCode == 200,
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        httpClient.data(for: request) { status, data in
+            guard let data, status == 200,
                   let fetched = try? JSONDecoder().decode(ConversionSchema.self, from: data) else {
                 return log("schema refresh failed — using cached version")
             }
@@ -1044,7 +1074,7 @@ public enum TrackHub {
                 UserDefaults.standard.set(data, forKey: schemaCacheKey)
                 log("schema v\(fetched.schemaVersion) active (\(fetched.rules.count) rules)")
             }
-        }.resume()
+        }
     }
 
     private static func loadCachedSchema() -> ConversionSchema? {
@@ -1130,9 +1160,20 @@ public enum TrackHub {
             return log("attribution fetch requires backendAttributionProvider")
         }
         apphudAttributionFetchInFlight = true
+        attributionFetchGeneration &+= 1
+        let generation = attributionFetchGeneration
+        queue.asyncAfter(deadline: .now() + callbackTimeout) {
+            guard apphudAttributionFetchInFlight,
+                  attributionFetchGeneration == generation else { return }
+            apphudAttributionFetchInFlight = false
+            finishAttributionCompletions(nil)
+            log("backend attribution fetch timed out — will retry")
+        }
         DispatchQueue.main.async {
             provider(config.userId) { responseData in
                 queue.async {
+                    guard apphudAttributionFetchInFlight,
+                          attributionFetchGeneration == generation else { return }
                     apphudAttributionFetchInFlight = false
                     guard let responseData,
                           let envelope = try? JSONDecoder().decode(ApphudAttributionEnvelope.self, from: responseData),
@@ -1219,52 +1260,165 @@ public enum TrackHub {
         return dir.appendingPathComponent(filename)
     }
 
-    // Send a report; on failure (offline / 5xx) buffer it for retry next launch.
+    // Persist first, then let one bounded delivery task drain the queue. A slow
+    // or unavailable TrackHub endpoint never occupies this state queue and
+    // never creates one URLSession task per buffered event.
     private static func send(
         path: String,
         body: [String: Any],
+        kind: String? = nil,
+        dedupeKey: String? = nil,
         completion: ((Int?) -> Void)? = nil
     ) {
         guard !trackingDisabled else { return }
         var payload = body
         if let testToken = config?.integrationTestToken { payload["test_run_token"] = testToken }
-        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
-        // Capture the queue that belongs to this delivery. A configure() mode
-        // switch may happen before URLSession calls us back; consulting the
-        // mutable global then could put a production failure in a Test Lab
-        // queue (or the reverse).
-        let targetQueue = eventQueue
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            log("\(path) payload is not JSON-serializable — skipped")
+            completion?(nil)
+            return
+        }
+        guard data.count <= maxReportBytes else {
+            log("\(path) payload exceeds \(maxReportBytes) bytes — skipped")
+            completion?(nil)
+            return
+        }
+        guard let targetQueue = eventQueue else {
+            completion?(nil)
+            return
+        }
+        let report = PendingReport(
+            path: path,
+            body: data,
+            kind: kind,
+            dedupeKey: dedupeKey
+        )
+        guard let reportID = targetQueue.enqueue(report) else {
+            log("\(path) could not be written to the offline queue — skipped")
+            completion?(nil)
+            return
+        }
+        let liveReportIDs = Set(targetQueue.items.map(\.id))
+        deliveryCompletions = deliveryCompletions.filter { liveReportIDs.contains($0.key) }
+        if let completion { deliveryCompletions[reportID] = completion }
         if attConsentDelayActive {
-            targetQueue?.enqueue(PendingReport(path: path, body: data))
             log("\(path) buffered during first-session ATT wait")
             return
         }
-        postRaw(path: path, bodyData: data) { status in
-            if isRetryable(status) {
-                queue.async { targetQueue?.enqueue(PendingReport(path: path, body: data)) }
-            } else if !isSuccess(status) {
-                log("report rejected with HTTP \(status ?? 0) — not queued")
-            }
-            completion?(status)
-        }
+        flush()
     }
 
-    // Drain buffered reports; each is signed FRESH at send time so a stale
-    // timestamp never rejects buffered traffic. Success/permanent rejects pop;
-    // only transient failures stay.
+    // Drain exactly one report at a time; each is signed FRESH at send time so
+    // a stale timestamp never rejects buffered traffic.
     private static func flush() {
         guard !trackingDisabled else { return }
         guard !attConsentDelayActive else { return }
-        guard let q = eventQueue else { return }
-        for report in q.items {
-            postRaw(path: report.path, bodyData: report.body) { status in
-                // Success and permanent 3xx/4xx responses leave the queue;
-                // transport failures, 408/429 and 5xx remain for retry.
-                if !isRetryable(status) {
-                    queue.async { q.remove(id: report.id) }
-                }
+        guard !deliveryInFlight else { return }
+        guard let targetQueue = eventQueue, let report = targetQueue.items.first else { return }
+
+        let notBefore = max(report.nextAttemptAt, transientRetryNotBefore ?? .distantPast)
+        if notBefore > Date() {
+            scheduleRetry(at: notBefore)
+            return
+        }
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        retryDeadline = nil
+        transientRetryNotBefore = nil
+        guard let networkConfig = currentNetworkConfig() else { return }
+
+        deliveryInFlight = true
+        postRaw(
+            config: networkConfig,
+            path: report.path,
+            bodyData: report.body
+        ) { status in
+            queue.async {
+                deliveryInFlight = false
+                handleDeliveryResult(
+                    targetQueue: targetQueue,
+                    report: report,
+                    status: status
+                )
+                flush()
             }
         }
+    }
+
+    private static func handleDeliveryResult(
+        targetQueue: EventQueue,
+        report: PendingReport,
+        status: Int?
+    ) {
+        guard targetQueue.items.contains(where: { $0.id == report.id }) else {
+            deliveryCompletions.removeValue(forKey: report.id)
+            return
+        }
+        if isRetryable(status) {
+            let attempts = report.attempts + 1
+            let delay = retryDelay(attempt: attempts, jitter: Double.random(in: 0...1))
+            let nextAttemptAt = Date().addingTimeInterval(delay)
+            // Keep an in-memory deadline as a fallback if protected storage is
+            // temporarily unavailable; this prevents a tight retry loop.
+            transientRetryNotBefore = nextAttemptAt
+            if !targetQueue.markRetry(
+                id: report.id,
+                attempts: attempts,
+                nextAttemptAt: nextAttemptAt
+            ) {
+                log("\(report.path) retry state could not be persisted")
+            }
+            log("\(report.path) delivery failed — retrying with backoff")
+            return
+        }
+
+        if !targetQueue.remove(id: report.id) {
+            log("\(report.path) queue removal could not be persisted")
+        }
+        let completion = deliveryCompletions.removeValue(forKey: report.id)
+        if isSuccess(status) {
+            switch report.kind {
+            case "production_install":
+                UserDefaults.standard.set(true, forKey: installSentKey)
+                log("install reported")
+                reportConsentUpdate()
+                fetchAttributionIfNeeded()
+            case "test_install":
+                log("integration-test install reported")
+            default:
+                break
+            }
+        } else {
+            log("\(report.path) rejected with HTTP \(status ?? 0) — not retried")
+        }
+        completion?(status)
+    }
+
+    private static func scheduleRetry(at date: Date) {
+        if let current = retryDeadline, current <= date { return }
+        retryWorkItem?.cancel()
+        let workItem = DispatchWorkItem {
+            retryWorkItem = nil
+            retryDeadline = nil
+            flush()
+        }
+        retryWorkItem = workItem
+        retryDeadline = date
+        queue.asyncAfter(
+            deadline: .now() + max(0, date.timeIntervalSinceNow),
+            execute: workItem
+        )
+    }
+
+    @_spi(Testing) public static func retryDelay(
+        attempt: Int,
+        jitter: Double
+    ) -> TimeInterval {
+        let exponent = min(max(0, attempt - 1), 9)
+        let cap = min(retryMaxInterval, retryBaseInterval * pow(2, Double(exponent)))
+        let unit = min(max(0, jitter.isFinite ? jitter : 0), 1)
+        return cap / 2 + (cap / 2 * unit)
     }
 
     private static func resolveDeviceId() -> String {
@@ -1416,20 +1570,26 @@ public enum TrackHub {
         return status == 408 || status == 429 || status >= 500
     }
 
-    private static func postRaw(path: String, bodyData: Data, completion: @escaping (Int?) -> Void) {
-        postRawResponse(path: path, bodyData: bodyData) { status, _ in completion(status) }
+    private static func currentNetworkConfig() -> NetworkConfig? {
+        guard let config else { return nil }
+        return NetworkConfig(
+            endpoint: config.endpoint,
+            ingestToken: config.ingestToken,
+            sdkSecret: config.sdkSecret
+        )
     }
 
-    private static func postRawResponse(
+    private static func postRaw(
+        config: NetworkConfig,
         path: String,
         bodyData: Data,
-        completion: @escaping (Int?, Data?) -> Void
+        completion: @escaping (Int?) -> Void
     ) {
-        guard let config else { return completion(nil, nil) }
         let url = config.endpoint.appendingPathComponent("ingest").appendingPathComponent(config.ingestToken).appendingPathComponent(path)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("TrackHub-iOS/\(Self.sdkVersion)", forHTTPHeaderField: "User-Agent")
         request.httpBody = bodyData
         if let secret = config.sdkSecret, !secret.isEmpty {
             let ts = String(Int(Date().timeIntervalSince1970 * 1000))
@@ -1440,9 +1600,7 @@ public enum TrackHub {
             request.setValue("2", forHTTPHeaderField: "X-TrackHub-Signature-Version")
             request.setValue(mac.map { String(format: "%02x", $0) }.joined(), forHTTPHeaderField: "X-TrackHub-Signature")
         }
-        URLSession.shared.dataTask(with: request) { data, response, _ in
-            completion((response as? HTTPURLResponse)?.statusCode, data)
-        }.resume()
+        httpClient.data(for: request) { status, _ in completion(status) }
     }
 
     static func log(_ message: String) {

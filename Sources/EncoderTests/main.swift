@@ -117,6 +117,97 @@ reloaded.remove(id: "b")
 check(reloaded.items.map { $0.id } == ["c"], "remove(id:) pops a delivered report")
 try? FileManager.default.removeItem(at: tmp)
 
+let boundedTmp = FileManager.default.temporaryDirectory.appendingPathComponent("thq-bounded-\(UUID().uuidString).json")
+let bounded = EventQueue(maxItems: 2, maxBytes: 2_048, maxItemBytes: 128, url: boundedTmp)
+check(
+    bounded.enqueue(PendingReport(path: "sdk/track", body: Data(repeating: 1, count: 129))) == nil,
+    "offline buffer rejects an oversized individual report"
+)
+let installID = bounded.enqueue(PendingReport(
+    id: "install-a",
+    path: "install",
+    body: Data("install-1".utf8),
+    kind: "production_install",
+    dedupeKey: "install"
+))
+bounded.enqueue(PendingReport(id: "event-a", path: "sdk/track", body: Data("a".utf8)))
+bounded.enqueue(PendingReport(id: "event-b", path: "sdk/track", body: Data("b".utf8)))
+check(
+    bounded.items.map(\.id) == ["install-a", "event-b"],
+    "normal traffic cannot evict the queued production install"
+)
+let replacementID = bounded.enqueue(PendingReport(
+    id: "install-b",
+    path: "install",
+    body: Data("install-2".utf8),
+    kind: "production_install",
+    dedupeKey: "install"
+))
+check(
+    installID == replacementID && bounded.items.first?.body == Data("install-2".utf8),
+    "install retries deduplicate while retaining their durable FIFO id"
+)
+let retryAt = Date().addingTimeInterval(60)
+check(
+    bounded.markRetry(id: "install-a", attempts: 3, nextAttemptAt: retryAt),
+    "retry metadata is written durably"
+)
+let boundedReloaded = EventQueue(maxItems: 2, maxBytes: 2_048, maxItemBytes: 128, url: boundedTmp)
+check(
+    boundedReloaded.items.first?.attempts == 3 &&
+        abs((boundedReloaded.items.first?.nextAttemptAt.timeIntervalSince(retryAt)) ?? 99) < 0.001,
+    "retry backoff survives an app restart"
+)
+check(
+    ((try? Data(contentsOf: boundedTmp).count) ?? Int.max) <= 2_048,
+    "persisted offline queue stays within its byte budget"
+)
+try? FileManager.default.removeItem(at: boundedTmp)
+
+check(
+    TrackHub.retryDelay(attempt: 1, jitter: 0) == 0.5 &&
+        TrackHub.retryDelay(attempt: 1, jitter: 1) == 1,
+    "first retry uses bounded full-jitter backoff"
+)
+check(
+    TrackHub.retryDelay(attempt: 99, jitter: 1) == 300,
+    "retry backoff is capped at five minutes"
+)
+
+// ── Host resilience when TrackHub is unavailable ────────────────────────────
+let outageToken = "outage-\(UUID().uuidString)"
+let outageNamespace = TrackHub.offlineQueueNamespace(for: outageToken)
+let outageDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    ?? FileManager.default.temporaryDirectory
+let outageURL = outageDirectory.appendingPathComponent("trackhub_queue_\(outageNamespace).json")
+try? FileManager.default.removeItem(at: outageURL)
+let publicCallStarted = Date()
+TrackHub.configure(
+    endpoint: URL(string: "http://127.0.0.1:9")!,
+    ingestToken: "outage-test-ingest-token",
+    userId: "outage-test-user",
+    integrationTestToken: outageToken
+)
+TrackHub.trackEvent("invalid_payload", callbackParams: ["not_finite": Double.nan])
+for index in 0..<25 { TrackHub.trackEvent("offline_\(index)") }
+check(
+    Date().timeIntervalSince(publicCallStarted) < 1,
+    "public tracking calls stay non-blocking while TrackHub is unavailable"
+)
+let outageDeadline = Date().addingTimeInterval(5)
+var persistedTrackCount = 0
+while Date() < outageDeadline {
+    let snapshot = EventQueue(url: outageURL)
+    persistedTrackCount = snapshot.items.filter { $0.path == "sdk/track" }.count
+    if persistedTrackCount >= 25 { break }
+    Thread.sleep(forTimeInterval: 0.025)
+}
+check(
+    persistedTrackCount >= 25,
+    "an unavailable TrackHub server cannot prevent events reaching durable storage"
+)
+try? FileManager.default.removeItem(at: outageURL)
+
 let productionQueue = TrackHub.offlineQueueNamespace(for: nil)
 let testQueueA = TrackHub.offlineQueueNamespace(for: "test-run-token-with-enough-entropy-a")
 let testQueueB = TrackHub.offlineQueueNamespace(for: "test-run-token-with-enough-entropy-b")

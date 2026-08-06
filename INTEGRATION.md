@@ -190,9 +190,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 }
 ```
 
-`configure(…)` is safe to call every launch — it reports the install **only on first launch**
-(retries next launch if the network call fails), and refreshes the Apple attribution conversion schema each
-launch. All work is async on a background queue; it never blocks the main thread.
+`configure(…)` is safe to call every launch — it reports the install **only on first launch**.
+The install is persisted before delivery and retries with bounded backoff in the current process and
+across later launches until TrackHub acknowledges it. The Apple attribution conversion schema refreshes
+each launch. All work is async on a background queue; it never blocks the main thread.
 
 The Apphud handlers use the current official `setDeviceIdentifiers` and `setAttribution` APIs
 that Apphud documents for MMPs such as Adjust. `AppBackend` authenticates the signed-in user,
@@ -288,8 +289,8 @@ TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
 ```
 
 `track(…)` (without "Event") still exists for **SKAN‑only** conversion values — it does not send
-analytics. Prefer `trackEvent` for everything new. Events buffer offline and retry on the next
-launch, so a flaky network never drops them.
+analytics. Prefer `trackEvent` for everything new. Events are persisted before delivery and drain one
+at a time with bounded backoff, including across later launches, so a flaky network never drops them.
 
 Revenue/subscription tracking does **not** go through SDK events — Apphud/S2S webhooks are the
 source of truth. Current SDKs expose no revenue parameter on `trackEvent`.
@@ -383,8 +384,8 @@ the app's data).
 
 - **First launch:** one `POST /ingest/{token}/install` carrying the Apphud `user_id`, app/OS
   version, and the `sdk_name`/`sdk_version` integration markers (inside
-  the HMAC‑signed body when Signature is on). Repeat launches are no‑ops; a failed report
-  retries next launch.
+  the HMAC‑signed body when Signature is on). The report stays in the bounded disk queue and retries
+  with backoff until acknowledged; repeat launches are no-ops after that acknowledgement.
 - **Every launch:** `GET /ingest/{token}/cv-schema` refreshes and caches the active conversion
   schema, so Conversion Hub edits reach devices without an app release.
 - **Apphud attribution:** the authenticated host backend calls
