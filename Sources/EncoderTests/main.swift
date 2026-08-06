@@ -164,6 +164,24 @@ check(
 )
 try? FileManager.default.removeItem(at: boundedTmp)
 
+let corruptTmp = FileManager.default.temporaryDirectory
+    .appendingPathComponent("thq-corrupt-\(UUID().uuidString).json")
+try? Data("not-json".utf8).write(to: corruptTmp, options: .atomic)
+let recoveredFromCorrupt = EventQueue(url: corruptTmp)
+let corruptPrefix = corruptTmp.lastPathComponent + ".corrupt-"
+let quarantineFiles = (try? FileManager.default.contentsOfDirectory(
+    at: corruptTmp.deletingLastPathComponent(),
+    includingPropertiesForKeys: nil
+)) ?? []
+let quarantined = quarantineFiles.filter { $0.lastPathComponent.hasPrefix(corruptPrefix) }
+check(
+    recoveredFromCorrupt.items.isEmpty &&
+        !FileManager.default.fileExists(atPath: corruptTmp.path) &&
+        quarantined.count == 1,
+    "a corrupt offline queue is quarantined without crashing the host app"
+)
+for url in quarantined { try? FileManager.default.removeItem(at: url) }
+
 check(
     TrackHub.retryDelay(attempt: 1, jitter: 0) == 0.5 &&
         TrackHub.retryDelay(attempt: 1, jitter: 1) == 1,

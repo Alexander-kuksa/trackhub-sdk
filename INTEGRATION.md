@@ -1,5 +1,9 @@
 # TrackHub iOS SDK — Integration Guide
 
+> **Версия инструкции:** TrackHub iOS SDK `1.10.1`, iOS 14+, проверено 6 августа 2026 г.
+> Контракты сервера: [`docs/SDK_CONTRACT.md`](../docs/SDK_CONTRACT.md); диагностика платформы:
+> [`docs/TROUBLESHOOTING.md`](../docs/TROUBLESHOOTING.md).
+
 A complete, copy‑paste walkthrough for adding the TrackHub SDK to a **native iOS (Swift)**
 app. Hand this to whoever owns the app's Xcode project. The integration keeps Apphud as the
 financial source of truth while TrackHub owns attribution and product-event delivery.
@@ -51,12 +55,12 @@ Conversion API path and is not Firebase.
 
 **Xcode:** *File → Add Package Dependencies…* →
 `https://github.com/Alexander-kuksa/trackhub-sdk` → Dependency Rule: **Up to Next Major** from
-`1.10.0` → add the **`TrackHub`** library to your app target.
+`1.10.1` → add the **`TrackHub`** library to your app target.
 
 Or in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.1")
 // …and in the target's dependencies:
 .product(name: "TrackHub", package: "trackhub-sdk")
 ```
@@ -194,6 +198,30 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 The install is persisted before delivery and retries with bounded backoff in the current process and
 across later launches until TrackHub acknowledges it. The Apple attribution conversion schema refreshes
 each launch. All work is async on a background queue; it never blocks the main thread.
+
+### Если TrackHub недоступен
+
+- SDK сначала сохраняет отчёт, поэтому DNS/TLS error, timeout, HTTP `408`, `429` или `5xx`
+  не теряет его и не ломает запуск приложения;
+- один worker отправляет отчёты строго по очереди, с backoff+jitter до 5 минут;
+- HTTP request ограничен 10 секундами, resource lifetime — 30 секундами, response — 64 KiB;
+- очередь ограничена 1 000 элементами / 4 MiB, отдельный payload — 64 KiB;
+- при переполнении раньше удаляется обычная аналитика, а неподтверждённый production install
+  сохраняет приоритет;
+- постоянный `4xx` не повторяется: исправьте endpoint, token, signature или payload и выпустите
+  новую сборку;
+- callback хост-приложения имеет watchdog 15 секунд. Всегда вызывайте `completion` ровно один раз,
+  но даже забытый callback не должен навсегда заблокировать SDK.
+
+SDK `1.10.1` безопасен при повторном `configure`: в одном namespace остаётся один
+queue instance. До first unlock новые reports не дропаются: они временно буферизуются в memory
+и атомарно сливаются с disk queue, когда protected storage становится доступным. One-shot click
+refs очищаются только после durable enqueue session; UIKit device snapshot всегда снимается на
+main thread, даже если host вызвал `configure` из background queue.
+
+Это гарантия изоляции, а не гарантия бесконечного хранения. При длительной офлайн-работе сверх
+лимитов самые старые второстепенные события могут быть вытеснены. Следите за Data Health и
+проводите отдельный canary после восстановления сервера.
 
 The Apphud handlers use the current official `setDeviceIdentifiers` and `setAttribution` APIs
 that Apphud documents for MMPs such as Adjust. `AppBackend` authenticates the signed-in user,
@@ -377,6 +405,21 @@ the app's data).
 | `attribution fetch requires backendAttributionProvider` | Supply a provider that calls your authenticated app backend. That backend calls TrackHub with a linked S2S token; never put the token in the app. |
 | Legacy ASA attribution is absent | Expected by default. Re-enable both SDK `enableLegacyAsaAttribution` and backend `ENABLE_LEGACY_ASA_PROCESSING` only for an intentional rollback. |
 | `track(…) before schema is available` | Called before the first schema fetch finished; harmless — the next launch caches the schema. Schema also persists across launches once fetched. |
+| TrackHub server is offline | Expected behavior: the host app continues normally, and reports remain in the bounded queue. Restore the endpoint, foreground/relaunch the app and verify that the queue drains in Test Lab/Data Health. |
+| Repeating `rejected with HTTP 4xx — not retried` | This is a permanent configuration/contract failure, not a transient outage. Check endpoint, ingest token, SDK secret/signature and server/SDK version compatibility. |
+
+---
+
+## Upgrade checklist
+
+При обновлении существующего приложения до `1.10.1`:
+
+1. Закрепите tag `1.10.1`, очистите Package Resolution только если Xcode всё ещё показывает
+   старую версию, затем убедитесь, что в install payload виден `sdk_version=1.10.1`.
+2. Не меняйте `ingestToken`, `sdkSecret` или Apphud `userId` без серверной ротации и плана миграции.
+3. Добавьте backend callbacks для attribution/erasure; S2S secret никогда не переносите в приложение.
+4. Проверьте ATT, Apphud identifiers, deep links, APNs token и purchase observation на реальном устройстве.
+5. Пройдите shadow Test Lab, затем отдельно разрешённый live canary. Удалите test token из release build.
 
 ---
 

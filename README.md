@@ -1,5 +1,9 @@
 # TrackHub iOS SDK
 
+> **Текущая версия:** `1.10.1` · **минимальная iOS:** 14 · **проверено:** 6 августа 2026 г.
+> Полная документация платформы: [`docs/README.md`](../docs/README.md). Пошаговое подключение:
+> [`INTEGRATION.md`](INTEGRATION.md).
+
 Lightweight Swift package: install/session reporting, Google click context and
 remote-controlled SKAdNetwork and AdAttributionKit conversion values
 (Conversion Hub — edit the schema in the TrackHub UI, devices pick it up without an app release).
@@ -9,18 +13,18 @@ remote-controlled SKAdNetwork and AdAttributionKit conversion values
 
 > **Build status.** GitHub Actions (`.github/workflows/ios-ci.yml`) builds the Swift package,
 > runs the executable contract suite and compiles the library for a generic iOS Simulator on
-> every push and pull request. The source below requires the `1.10.0` release tag to be published
+> every push and pull request. The source below requires the `1.10.1` release tag to be published
 > before consumer apps can resolve that version.
 
 ## Install
 
 Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
-Dependency Rule: Up to Next Major `1.10.0`. iOS 14+, no third-party dependencies.
+Dependency Rule: Up to Next Major `1.10.1`. iOS 14+, no third-party dependencies.
 
 Swift Package Manager (`Package.swift`):
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.0")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.1")
 ```
 
 ## Usage
@@ -116,7 +120,7 @@ been explicitly re-enabled for legacy ASA processing.
 
 ### AdAttributionKit
 
-SDK 1.8 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
+SDK 1.10.1 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
 `AttributionCopyEndpoint` Info.plist key using the origin shown on the app page in TrackHub. To
 receive re-engagement copies, also enable
 `EligibleForAdAttributionKitReengagementPostbackCopies`.
@@ -216,6 +220,39 @@ What happens under the hood:
   `updatePostbackConversionValue(_:coarseValue:lockWindow:)` on iOS 16.1+, fine-only on 15.4+,
   legacy `updateConversionValue` on 14.x. No-op when the event has no rule in the active schema.
 
+## Поведение при сбоях
+
+Недоступность TrackHub не должна приводить к падению, зависанию или замедлению интерфейса
+клиентского приложения. Сеть, файловая очередь и host callbacks выполняются асинхронно; наружу
+не пробрасываются сетевые исключения. Ограничения намеренно конечны, чтобы сбой сервера не мог
+создать неограниченное потребление памяти, диска или потоков.
+
+| Механизм | Гарантия SDK 1.10.1 |
+|---|---|
+| Запись | Каждый install/session/event сначала атомарно записывается в защищённую файловую очередь, затем отправляется |
+| Очередь | До 1 000 отчётов и 4 MiB суммарно; один отчёт — до 64 KiB |
+| Переполнение | Удаляются самые старые обычные события; production install защищён от вытеснения обычной аналитикой |
+| Параллелизм | Один delivery worker и не более одного отправляемого отчёта одновременно |
+| Таймауты | 10 секунд на запрос, 30 секунд на ресурс, максимум 64 KiB ответа |
+| Повторы | Сетевые ошибки, HTTP `408`, `429` и `5xx`; exponential backoff с jitter от 0,5 секунды до 5 минут |
+| Без повторов | Остальные `4xx` считаются ошибкой контракта и удаляются, чтобы не блокировать очередь навсегда |
+| Install | Флаг «отправлено» ставится только после HTTP `2xx`; после краша или перезапуска неподтверждённый install повторяется |
+| Host callbacks | Attribution/Apphud/backend callback ограничен watchdog в 15 секунд; зависший код приложения не стопорит SDK навсегда |
+| Privacy erase | После успешного `forgetDevice` локальная очередь удаляется, а дальнейший tracking для этого app token блокируется |
+
+Повторный `configure` в том же production/Test-Lab namespace переиспользует один
+`EventQueue`: in-flight response от старой конфигурации не может затереть новые reports. Если
+iOS protected storage ещё недоступно до first unlock, SDK держит новые reports в памяти,
+затем сливает их с дисковой FIFO перед delivery. Повреждённая очередь quarantine'ится как
+`*.corrupt-<timestamp>` для диагностики. Одноразовые `gclid`/`gbraid`/`oppref` удаляются
+только после durable enqueue соответствующей session. `UIDevice`/IDFV snapshot снимается на
+main thread до запуска фонового state machine.
+
+Перманентная ошибка записи или payload сверх 64 KiB пропускает только конкретный
+отчёт и пишет диагностику при `debug: true`; временно закрытое protected storage обрабатывается
+отдельно и reports не дропаются. Серверная дедупликация делает безопасным возможный повтор после сбоя между
+HTTP `2xx` и локальным удалением элемента.
+
 ## Notes
 
 - Revenue/subscription source of truth is Apphud/S2S (webhooks + server notifications), not SDK
@@ -255,5 +292,11 @@ Core logic (schema decoding + conversion value encoder) is platform-independent 
 a parity test suite that mirrors the backend tests:
 
 ```bash
+swift build
 swift run encoder-tests
+xcodebuild -scheme TrackHub -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
+
+Перед выпуском также соберите реальное приложение-потребитель и пройдите Integration Test Lab:
+package build подтверждает компиляцию SDK, но не entitlement, Universal Links, ATT-текст,
+доставку APNs или фактическое принятие conversion внешним провайдером.

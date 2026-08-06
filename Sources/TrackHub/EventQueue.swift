@@ -81,7 +81,7 @@ import Foundation
 
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if fileSize > maxBytes * 2 {
-            try? FileManager.default.removeItem(at: url)
+            quarantineStorage()
             return
         }
         guard FileManager.default.fileExists(atPath: url.path) else { return }
@@ -95,7 +95,7 @@ import Foundation
             return
         }
         guard let decoded = try? JSONDecoder().decode([PendingReport].self, from: data) else {
-            try? FileManager.default.removeItem(at: url)
+            quarantineStorage()
             return
         }
         items = decoded
@@ -106,12 +106,14 @@ import Foundation
 
     public var count: Int { items.count }
 
-    /// Returns the durable report id, or nil when serialization/storage limits
-    /// prevent persistence. A dedupe key replaces the prior logical report
-    /// while retaining its id and FIFO position.
+    /// Returns the accepted report id, or nil when serialization/storage limits
+    /// prevent acceptance. Before first unlock, iOS protected storage can be
+    /// temporarily unreadable; new reports remain in memory and are merged
+    /// with the disk queue as soon as protection becomes available.
     @discardableResult
     public func enqueue(_ report: PendingReport) -> String? {
-        guard reloadStorageIfNeeded(), report.body.count <= maxItemBytes else { return nil }
+        guard report.body.count <= maxItemBytes else { return nil }
+        let storageReady = reloadStorageIfNeeded()
         let previous = items
         var stored = report
         if let key = report.dedupeKey,
@@ -130,11 +132,21 @@ import Foundation
             items.append(stored)
         }
         trimToLimits()
-        guard items.contains(where: { $0.id == stored.id }), persist() else {
+        guard items.contains(where: { $0.id == stored.id }) else {
+            items = previous
+            return nil
+        }
+        if storageReady, !persist() {
             items = previous
             return nil
         }
         return stored.id
+    }
+
+    /// Reloads and merges protected disk state before network delivery. A
+    /// caller should retry later when this returns false.
+    public func prepareForDelivery() -> Bool {
+        reloadStorageIfNeeded()
     }
 
     @discardableResult
@@ -214,20 +226,39 @@ import Foundation
         do {
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
             if let decoded = try? JSONDecoder().decode([PendingReport].self, from: data) {
+                let deferred = items
                 items = decoded
+                for report in deferred {
+                    if let index = items.firstIndex(where: {
+                        $0.id == report.id || (
+                            report.dedupeKey != nil && $0.dedupeKey == report.dedupeKey
+                        )
+                    }) {
+                        items[index] = report
+                    } else {
+                        items.append(report)
+                    }
+                }
                 storageNeedsReload = false
                 let loaded = items
                 trimToLimits()
-                if loaded != items { return persist() }
-                return true
+                return deferred.isEmpty && loaded == items ? true : persist()
             }
-            try? FileManager.default.removeItem(at: url)
-            items = []
+            quarantineStorage()
             storageNeedsReload = false
-            return true
+            trimToLimits()
+            return persist()
         } catch {
             return false
         }
+    }
+
+    private func quarantineStorage() {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let quarantineURL = url.appendingPathExtension(
+            "corrupt-\(Int(Date().timeIntervalSince1970 * 1_000))"
+        )
+        try? FileManager.default.moveItem(at: url, to: quarantineURL)
     }
 
     @discardableResult

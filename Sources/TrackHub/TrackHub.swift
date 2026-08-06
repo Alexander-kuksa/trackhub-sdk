@@ -111,7 +111,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.10.0"
+    public static let sdkVersion = "1.10.1"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -119,6 +119,7 @@ public enum TrackHub {
     private static var debugLogging = false
     private static var sessionTracker: SessionTracker?
     private static var eventQueue: EventQueue?
+    private static var eventQueueNamespace: String?
     private static let httpClient = BoundedHTTPClient()
     private static var deliveryInFlight = false
     private static var retryWorkItem: DispatchWorkItem?
@@ -129,6 +130,9 @@ public enum TrackHub {
     private static var attributionFetchGeneration: UInt64 = 0
     private static var activeForgetRequests: Set<UUID> = []
     private static var currentAttributionSnapshot: TrackHubAttribution?
+    // Accessed only on TrackHub.queue. UIKit device values are captured on the
+    // main thread before configuration work enters the SDK state machine.
+    private static var identifierForVendorSnapshot: String?
     private static var attributionCompletions: [(TrackHubAttribution?) -> Void] = []
     private static var trackingDisabled = false
     private static var attConsentDelayActive = false
@@ -222,7 +226,9 @@ public enum TrackHub {
             print("[TrackHub] refusing non-HTTPS endpoint \(endpoint) — SDK not configured")
             return
         }
-        queue.async {
+        let applyConfiguration: (String?) -> Void = { capturedIdfv in
+          queue.async {
+            identifierForVendorSnapshot = capturedIdfv
             let testToken = integrationTestToken?.trimmingCharacters(in: .whitespacesAndNewlines)
             config = Config(
                 endpoint: endpoint,
@@ -260,14 +266,17 @@ public enum TrackHub {
             schema = loadCachedSchema()
             sessionTracker = sessionTracker ?? SessionTracker()
             // Test Lab reports must never drain the production offline queue.
-            // Each run gets a token-hash namespace; production keeps its stable
-            // queue. Recreate on configure so switching modes cannot reuse the
-            // previous in-memory queue accidentally.
+            // Keep the same in-memory instance for repeated configure calls in
+            // one namespace so a stale instance cannot overwrite newer state.
             retryWorkItem?.cancel()
             retryWorkItem = nil
             retryDeadline = nil
             transientRetryNotBefore = nil
-            eventQueue = EventQueue(url: queueFileURL(testToken: config?.integrationTestToken))
+            let namespace = offlineQueueNamespace(for: config?.integrationTestToken)
+            if eventQueue == nil || eventQueueNamespace != namespace {
+                eventQueue = EventQueue(url: queueFileURL(testToken: config?.integrationTestToken))
+                eventQueueNamespace = namespace
+            }
             startATTConsentDelayIfNeeded()
             publishApphudDeviceIdentifiers()
             SKANUpdater.registerForAttribution()
@@ -278,7 +287,22 @@ public enum TrackHub {
             refreshSchema()
             startSessionTracking()
             flush()
+          }
         }
+        #if os(iOS)
+        if Thread.isMainThread {
+            applyConfiguration(UIDevice.current.identifierForVendor?.uuidString)
+        } else {
+            // `UIDevice.current` is main-thread isolated on modern SDKs. Keep
+            // configure non-blocking while preserving ordering: the state
+            // machine starts only after the snapshot has been captured.
+            DispatchQueue.main.async {
+                applyConfiguration(UIDevice.current.identifierForVendor?.uuidString)
+            }
+        }
+        #else
+        applyConfiguration(nil)
+        #endif
     }
 
     /// Update the user id after configure (e.g. once the billing SDK resolves it).
@@ -932,13 +956,18 @@ public enum TrackHub {
         if let oppref = defaults.string(forKey: pendingOpenAiOpprefKey) {
             body["oppref"] = oppref
         }
-        defaults.removeObject(forKey: pendingGclidKey)
-        defaults.removeObject(forKey: pendingGbraidKey)
-        defaults.removeObject(forKey: pendingOpenAiOpprefKey)
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
-        send(path: "sdk/session", body: body) { status in
+        let accepted = send(path: "sdk/session", body: body) { status in
             if isSuccess(status) { queue.async { fetchAttributionIfNeeded() } }
+        }
+        if accepted {
+            // Attribution references are one-shot, but only after the exact
+            // session payload is durable. A full or temporarily unavailable
+            // queue must not turn an enqueue failure into permanent loss.
+            defaults.removeObject(forKey: pendingGclidKey)
+            defaults.removeObject(forKey: pendingGbraidKey)
+            defaults.removeObject(forKey: pendingOpenAiOpprefKey)
         }
     }
 
@@ -1263,30 +1292,31 @@ public enum TrackHub {
     // Persist first, then let one bounded delivery task drain the queue. A slow
     // or unavailable TrackHub endpoint never occupies this state queue and
     // never creates one URLSession task per buffered event.
+    @discardableResult
     private static func send(
         path: String,
         body: [String: Any],
         kind: String? = nil,
         dedupeKey: String? = nil,
         completion: ((Int?) -> Void)? = nil
-    ) {
-        guard !trackingDisabled else { return }
+    ) -> Bool {
+        guard !trackingDisabled else { return false }
         var payload = body
         if let testToken = config?.integrationTestToken { payload["test_run_token"] = testToken }
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload) else {
             log("\(path) payload is not JSON-serializable — skipped")
             completion?(nil)
-            return
+            return false
         }
         guard data.count <= maxReportBytes else {
             log("\(path) payload exceeds \(maxReportBytes) bytes — skipped")
             completion?(nil)
-            return
+            return false
         }
         guard let targetQueue = eventQueue else {
             completion?(nil)
-            return
+            return false
         }
         let report = PendingReport(
             path: path,
@@ -1297,16 +1327,17 @@ public enum TrackHub {
         guard let reportID = targetQueue.enqueue(report) else {
             log("\(path) could not be written to the offline queue — skipped")
             completion?(nil)
-            return
+            return false
         }
         let liveReportIDs = Set(targetQueue.items.map(\.id))
         deliveryCompletions = deliveryCompletions.filter { liveReportIDs.contains($0.key) }
         if let completion { deliveryCompletions[reportID] = completion }
         if attConsentDelayActive {
             log("\(path) buffered during first-session ATT wait")
-            return
+            return true
         }
         flush()
+        return true
     }
 
     // Drain exactly one report at a time; each is signed FRESH at send time so
@@ -1315,7 +1346,14 @@ public enum TrackHub {
         guard !trackingDisabled else { return }
         guard !attConsentDelayActive else { return }
         guard !deliveryInFlight else { return }
-        guard let targetQueue = eventQueue, let report = targetQueue.items.first else { return }
+        guard let targetQueue = eventQueue else { return }
+        guard targetQueue.prepareForDelivery() else {
+            // Complete-until-first-authentication storage may be unavailable
+            // briefly after boot. Do not overwrite or skip the disk backlog.
+            scheduleRetry(at: Date().addingTimeInterval(30))
+            return
+        }
+        guard let report = targetQueue.items.first else { return }
 
         let notBefore = max(report.nextAttemptAt, transientRetryNotBefore ?? .distantPast)
         if notBefore > Date() {
@@ -1468,11 +1506,10 @@ public enum TrackHub {
     }
 
     private static func appendAppConversionUserAgentContext(to body: inout [String: Any]) {
-        #if os(iOS)
-        body["os_version"] = UIDevice.current.systemVersion
-        #else
-        body["os_version"] = ProcessInfo.processInfo.operatingSystemVersionString
-        #endif
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        body["os_version"] = version.patchVersion > 0
+            ? "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+            : "\(version.majorVersion).\(version.minorVersion)"
         body["locale"] = Locale.current.identifier.replacingOccurrences(of: "-", with: "_")
         if let model = systemValue("hw.machine") { body["device_model"] = model }
         if let build = systemValue("kern.osversion") { body["build"] = build }
@@ -1511,7 +1548,7 @@ public enum TrackHub {
             body["device_id"] = idfa
             body["device_id_type"] = "idfa"
             body["limit_ad_tracking"] = false
-        } else if let idfv = UIDevice.current.identifierForVendor?.uuidString {
+        } else if let idfv = identifierForVendorSnapshot {
             // ID type and LAT are independent in Google's v1.1 contract.
             body["device_id"] = idfv
             body["device_id_type"] = "idfv"
@@ -1528,7 +1565,7 @@ public enum TrackHub {
         #if os(iOS)
         guard let handler = config?.apphudDeviceIdentifiersHandler else { return }
         let idfa = currentAuthorizedIDFA()
-        let idfv = UIDevice.current.identifierForVendor?.uuidString
+        let idfv = identifierForVendorSnapshot
         DispatchQueue.main.async { handler(idfa, idfv) }
         #endif
     }
