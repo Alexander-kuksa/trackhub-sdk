@@ -147,6 +147,11 @@ TrackHub.
 SDK отклоняет plaintext HTTP, кроме `localhost`/`127.0.0.1` для локальной разработки. Передавайте
 origin целиком и не конструируйте `/ingest/{token}` вручную.
 
+`backendAttributionProvider` и `backendPrivacyErasureHandler` опциональны. Без них
+обычные install/session/event, Google/OpenAI conversions и Apple Conversion Values
+продолжают работать. `AppBackend` в примерах ниже — placeholder вашего кода,
+а не тип из TrackHub, Apphud или Adjust.
+
 ### SwiftUI (`@main App`)
 
 If you have an `AppDelegate` adaptor, do it there (preferred). Otherwise, `App.init()`:
@@ -282,7 +287,9 @@ main thread, даже если host вызвал `configure` из background que
 
 ### Backend callbacks: обязательный security-контракт
 
-`backendAttributionProvider` и `backendPrivacyErasureHandler` не должны обращаться к TrackHub
+`backendAttributionProvider` нужен только для `getAttribution`,
+`attributionChangedHandler` и TrackHub→Apphud bridge. `backendPrivacyErasureHandler`
+нужен только для `forgetDevice`. Оба callback не должны обращаться к TrackHub
 прямо из приложения. Их задача — вызвать собственный authenticated backend приложения. Только
 backend хранит linked S2S token и вызывает TrackHub.
 
@@ -361,6 +368,23 @@ revision only when Apphud's callback returns `true`; network/Apphud failures
 retry after a later install/session success or `refreshApphudAttribution()`.
 Never embed or return the S2S token to the app. The app-wide `sdkSecret` cannot
 authorize attribution reads or privacy erasure because it ships in the binary.
+
+#### Это не Adjust API «один в один»
+
+Adjust SDK получает attribution напрямую из Adjust и отдаёт его через
+`adjustAttributionChanged`, `Adjust.attribution { ... }` или getter с timeout. Он не
+требует от host app callback, который идёт на backend самого приложения.
+Apphud для Adjust документирует отдельный мост
+`adjustAttributionChanged` → `Apphud.setAttribution(..., from: .adjust, ...)`. Он похож
+только на финальный TrackHub `apphudAttributionHandler`, а не на backend callbacks.
+
+Для удаления данных Adjust даёт прямой `Adjust.gdprForgetMe()`; у него
+нет host-backend callback и TrackHub-подобного `Bool`, который возвращается только
+после подтверждённого server `2xx`.
+
+Официальные источники: [Adjust attribution](https://dev.adjust.com/en/sdk/ios/features/attribution/),
+[Adjust privacy](https://dev.adjust.com/en/sdk/ios/features/privacy/),
+[Apphud Adjust integration](https://docs.apphud.com/docs/adjust).
 
 Configuration sends IDFV to Apphud immediately. Do not show ATT automatically at launch. After
 your own contextual explanation (commonly near the end of onboarding), call:

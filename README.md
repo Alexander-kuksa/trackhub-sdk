@@ -50,8 +50,7 @@ TrackHub.setGoogleAdsConsent(
 // )
 
 // On app launch (e.g. in AppDelegate / @main init), after Apphud starts.
-// Copy the app values from TrackHub → SDK integration. AppBackend below is
-// your authenticated API; it keeps the TrackHub S2S secret off the device.
+// Copy the app values from TrackHub → Setup → SDK integration.
 TrackHub.configure(
     endpoint: URL(string: "https://postbacks.example.com")!, // your ingest domain
     ingestToken: "<app ingest token from the TrackHub app page>",
@@ -61,26 +60,12 @@ TrackHub.configure(
     attConsentWaitingInterval: 120,  // first install waits for ATT, hard cap 360s
     apphudDeviceIdentifiersHandler: { idfa, idfv in
         Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv)
-    },
-    backendAttributionProvider: { userId, completion in
-        AppBackend.fetchTrackHubAttribution(userId: userId, completion: completion)
-    },
-    backendPrivacyErasureHandler: { userId, reason, completion in
-        AppBackend.eraseTrackHubUser(userId: userId, reason: reason, completion: completion)
-    },
-    apphudAttributionHandler: { data, completion in
-        Apphud.setAttribution(
-            data: ApphudAttributionData(rawData: data),
-            from: .custom,
-            identifer: nil,
-            callback: { accepted, _ in completion(accepted) }
-        )
-    },
-    attributionChangedHandler: { attribution in
-        // Update app routing/UI when a delayed click or reattribution wins.
-        print(attribution.network, attribution.campaignId ?? "organic")
     }
 )
+
+// Optional attribution reads/Apphud attribution bridge and forgetDevice need
+// host-backend callbacks. Add them only from INTEGRATION.md; AppBackend there is
+// your code, not an SDK class.
 
 // Show this only after your contextual explanation / onboarding step.
 // Requires NSUserTrackingUsageDescription in the host app's Info.plist.
@@ -105,12 +90,22 @@ TrackHub.trackPurchaseObserved(
 )
 ```
 
-`AppBackend` must authenticate the signed-in user, call TrackHub's
+Both backend callbacks are optional. Without them, install, session, event,
+Google/OpenAI conversion and Apple conversion-value measurement continues.
+`AppBackend` is placeholder host-app code, not an SDK type. If enabled, it must
+authenticate the signed-in user, call TrackHub's
 `/sdk/attribution` or `/sdk/forget-device` endpoint with the linked S2S
 connection's `X-TrackHub-Token`, and return the attribution response bytes or
 erasure success. Never return that S2S token to the app. Without these backend
 callbacks, attribution reads and `forgetDevice` fail closed; ordinary install,
 session, event and conversion-value measurement continues.
+
+This is not Adjust's API shape. Adjust obtains attribution directly through
+`adjustAttributionChanged` / `Adjust.attribution`, and its erasure API is the
+direct `Adjust.gdprForgetMe()` call. Apphud's documented Adjust bridge
+(`adjustAttributionChanged` → `Apphud.setAttribution(..., from: .adjust)`)
+is comparable only to TrackHub's final `apphudAttributionHandler` step, not to
+the two host-backend callbacks.
 
 Owned-media deferred paths currently use Google Play Install Referrer on
 Android. iOS intentionally receives no probabilistic IP/UA fallback until a
