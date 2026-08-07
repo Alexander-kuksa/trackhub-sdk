@@ -265,6 +265,10 @@ import Foundation
     private func persist() -> Bool {
         guard let data = try? JSONEncoder().encode(items), data.count <= maxBytes else { return false }
         do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
             try data.write(to: url, options: .atomic)
             #if os(iOS)
             // Buffered event parameters can be user data. Make their at-rest

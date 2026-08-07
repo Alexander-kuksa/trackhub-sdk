@@ -191,12 +191,30 @@ check(
     TrackHub.retryDelay(attempt: 99, jitter: 1) == 300,
     "retry backoff is capped at five minutes"
 )
+let clockResponse = try! JSONSerialization.data(withJSONObject: [
+    "error": "clock_skew",
+    "server_time_ms": 1_800_000_012_345 as Int64,
+])
+check(
+    TrackHub.serverClockOffset(
+        responseData: clockResponse,
+        localTimeMilliseconds: 1_800_000_000_000
+    ) == 12_345,
+    "clock-skew response preserves a queued signed event and supplies a safe offset"
+)
+check(
+    TrackHub.serverClockOffset(
+        responseData: Data("{\"error\":\"unauthorized\",\"server_time_ms\":1800000012345}".utf8),
+        localTimeMilliseconds: 1_800_000_000_000
+    ) == nil,
+    "ordinary authentication failures cannot change the SDK clock"
+)
 
 // ── Host resilience when TrackHub is unavailable ────────────────────────────
 let outageToken = "outage-\(UUID().uuidString)"
 let outageNamespace = TrackHub.offlineQueueNamespace(for: outageToken)
-let outageDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-    ?? FileManager.default.temporaryDirectory
+let outageDirectory = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+    ?? FileManager.default.temporaryDirectory).appendingPathComponent("TrackHub", isDirectory: true)
 let outageURL = outageDirectory.appendingPathComponent("trackhub_queue_\(outageNamespace).json")
 try? FileManager.default.removeItem(at: outageURL)
 let publicCallStarted = Date()

@@ -1,6 +1,6 @@
 # TrackHub iOS SDK — Integration Guide
 
-> **Версия инструкции:** TrackHub iOS SDK `1.10.1`, iOS 14+, проверено 6 августа 2026 г.
+> **Версия инструкции:** TrackHub iOS SDK `1.10.2`, iOS 14+, проверено 7 августа 2026 г.
 > Контракты сервера: [`docs/SDK_CONTRACT.md`](../docs/SDK_CONTRACT.md); диагностика платформы:
 > [`docs/TROUBLESHOOTING.md`](../docs/TROUBLESHOOTING.md).
 
@@ -55,12 +55,12 @@ Conversion API path and is not Firebase.
 
 **Xcode:** *File → Add Package Dependencies…* →
 `https://github.com/Alexander-kuksa/trackhub-sdk` → Dependency Rule: **Up to Next Major** from
-`1.10.1` → add the **`TrackHub`** library to your app target.
+`1.10.2` → add the **`TrackHub`** library to your app target.
 
 Or in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.1")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.2")
 // …and in the target's dependencies:
 .product(name: "TrackHub", package: "trackhub-sdk")
 ```
@@ -213,7 +213,7 @@ each launch. All work is async on a background queue; it never blocks the main t
 - callback хост-приложения имеет watchdog 15 секунд. Всегда вызывайте `completion` ровно один раз,
   но даже забытый callback не должен навсегда заблокировать SDK.
 
-SDK `1.10.1` безопасен при повторном `configure`: в одном namespace остаётся один
+SDK `1.10.2` безопасен при повторном `configure`: в одном namespace остаётся один
 queue instance. До first unlock новые reports не дропаются: они временно буферизуются в memory
 и атомарно сливаются с disk queue, когда protected storage становится доступным. One-shot click
 refs очищаются только после durable enqueue session; UIKit device snapshot всегда снимается на
@@ -412,10 +412,10 @@ the app's data).
 
 ## Upgrade checklist
 
-При обновлении существующего приложения до `1.10.1`:
+При обновлении существующего приложения до `1.10.2`:
 
-1. Закрепите tag `1.10.1`, очистите Package Resolution только если Xcode всё ещё показывает
-   старую версию, затем убедитесь, что в install payload виден `sdk_version=1.10.1`.
+1. Закрепите tag `1.10.2`, очистите Package Resolution только если Xcode всё ещё показывает
+   старую версию, затем убедитесь, что в install payload виден `sdk_version=1.10.2`.
 2. Не меняйте `ingestToken`, `sdkSecret` или Apphud `userId` без серверной ротации и плана миграции.
 3. Добавьте backend callbacks для attribution/erasure; S2S secret никогда не переносите в приложение.
 4. Проверьте ATT, Apphud identifiers, deep links, APNs token и purchase observation на реальном устройстве.

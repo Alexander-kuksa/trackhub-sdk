@@ -1,6 +1,6 @@
 # TrackHub iOS SDK
 
-> **Текущая версия:** `1.10.1` · **минимальная iOS:** 14 · **проверено:** 6 августа 2026 г.
+> **Текущая версия:** `1.10.2` · **минимальная iOS:** 14 · **проверено:** 7 августа 2026 г.
 > Полная документация платформы: [`docs/README.md`](../docs/README.md). Пошаговое подключение:
 > [`INTEGRATION.md`](INTEGRATION.md).
 
@@ -13,18 +13,18 @@ remote-controlled SKAdNetwork and AdAttributionKit conversion values
 
 > **Build status.** GitHub Actions (`.github/workflows/ios-ci.yml`) builds the Swift package,
 > runs the executable contract suite and compiles the library for a generic iOS Simulator on
-> every push and pull request. The source below requires the `1.10.1` release tag to be published
+> every push and pull request. The source below requires the `1.10.2` release tag to be published
 > before consumer apps can resolve that version.
 
 ## Install
 
 Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
-Dependency Rule: Up to Next Major `1.10.1`. iOS 14+, no third-party dependencies.
+Dependency Rule: Up to Next Major `1.10.2`. iOS 14+, no third-party dependencies.
 
 Swift Package Manager (`Package.swift`):
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.1")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.2")
 ```
 
 ## Usage
@@ -120,7 +120,7 @@ been explicitly re-enabled for legacy ASA processing.
 
 ### AdAttributionKit
 
-SDK 1.10.1 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
+SDK 1.10.2 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
 `AttributionCopyEndpoint` Info.plist key using the origin shown on the app page in TrackHub. To
 receive re-engagement copies, also enable
 `EligibleForAdAttributionKitReengagementPostbackCopies`.
@@ -227,7 +227,7 @@ What happens under the hood:
 не пробрасываются сетевые исключения. Ограничения намеренно конечны, чтобы сбой сервера не мог
 создать неограниченное потребление памяти, диска или потоков.
 
-| Механизм | Гарантия SDK 1.10.1 |
+| Механизм | Гарантия SDK 1.10.2 |
 |---|---|
 | Запись | Каждый install/session/event сначала атомарно записывается в защищённую файловую очередь, затем отправляется |
 | Очередь | До 1 000 отчётов и 4 MiB суммарно; один отчёт — до 64 KiB |
@@ -235,10 +235,15 @@ What happens under the hood:
 | Параллелизм | Один delivery worker и не более одного отправляемого отчёта одновременно |
 | Таймауты | 10 секунд на запрос, 30 секунд на ресурс, максимум 64 KiB ответа |
 | Повторы | Сетевые ошибки, HTTP `408`, `429` и `5xx`; exponential backoff с jitter от 0,5 секунды до 5 минут |
+| Clock skew | `401 clock_skew` с разумным server time корректирует только process-local время подписи; report остаётся в очереди и повторяется |
 | Без повторов | Остальные `4xx` считаются ошибкой контракта и удаляются, чтобы не блокировать очередь навсегда |
 | Install | Флаг «отправлено» ставится только после HTTP `2xx`; после краша или перезапуска неподтверждённый install повторяется |
 | Host callbacks | Attribution/Apphud/backend callback ограничен watchdog в 15 секунд; зависший код приложения не стопорит SDK навсегда |
 | Privacy erase | После успешного `forgetDevice` локальная очередь удаляется, а дальнейший tracking для этого app token блокируется |
+
+Очередь хранится в `Application Support/TrackHub`, исключена из backup и защищена
+до первой разблокировки устройства. При обновлении legacy-файл из `Caches`
+переносится один раз и больше не зависит от очистки системного cache.
 
 Повторный `configure` в том же production/Test-Lab namespace переиспользует один
 `EventQueue`: in-flight response от старой конфигурации не может затереть новые reports. Если

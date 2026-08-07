@@ -111,7 +111,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.10.1"
+    public static let sdkVersion = "1.10.2"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -125,6 +125,9 @@ public enum TrackHub {
     private static var retryWorkItem: DispatchWorkItem?
     private static var retryDeadline: Date?
     private static var transientRetryNotBefore: Date?
+    // Process-local correction learned from a trusted TrackHub clock-skew
+    // response. Queued events are always signed immediately before delivery.
+    private static var clockOffsetMilliseconds: Int64 = 0
     private static var deliveryCompletions: [String: (Int?) -> Void] = [:]
     private static var apphudAttributionFetchInFlight = false
     private static var attributionFetchGeneration: UInt64 = 0
@@ -1281,12 +1284,30 @@ public enum TrackHub {
     }
 
     private static func queueFileURL(testToken: String?) -> URL {
-        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+        let manager = FileManager.default
+        let base = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? manager.temporaryDirectory
+        let dir = base.appendingPathComponent("TrackHub", isDirectory: true)
+        try? manager.createDirectory(at: dir, withIntermediateDirectories: true)
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        var mutableDir = dir
+        try? mutableDir.setResourceValues(resourceValues)
         let namespace = offlineQueueNamespace(for: testToken)
         // Preserve the pre-Test-Lab production filename so an SDK upgrade still
         // drains already-buffered real events.
         let filename = namespace == "production" ? "trackhub_queue.json" : "trackhub_queue_\(namespace).json"
-        return dir.appendingPathComponent(filename)
+        let destination = dir.appendingPathComponent(filename)
+        // Caches may be purged by iOS. Migrate the pre-1.10.2 queue once into
+        // durable Application Support before constructing EventQueue.
+        if !manager.fileExists(atPath: destination.path),
+           let oldCaches = manager.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            let legacy = oldCaches.appendingPathComponent(filename)
+            if manager.fileExists(atPath: legacy.path) {
+                try? manager.moveItem(at: legacy, to: destination)
+            }
+        }
+        return destination
     }
 
     // Persist first, then let one bounded delivery task drain the queue. A slow
@@ -1371,13 +1392,14 @@ public enum TrackHub {
             config: networkConfig,
             path: report.path,
             bodyData: report.body
-        ) { status in
+        ) { status, responseData in
             queue.async {
                 deliveryInFlight = false
                 handleDeliveryResult(
                     targetQueue: targetQueue,
                     report: report,
-                    status: status
+                    status: status,
+                    responseData: responseData
                 )
                 flush()
             }
@@ -1387,15 +1409,19 @@ public enum TrackHub {
     private static func handleDeliveryResult(
         targetQueue: EventQueue,
         report: PendingReport,
-        status: Int?
+        status: Int?,
+        responseData: Data?
     ) {
         guard targetQueue.items.contains(where: { $0.id == report.id }) else {
             deliveryCompletions.removeValue(forKey: report.id)
             return
         }
-        if isRetryable(status) {
+        let correctedClock = status == 401 && applyServerClock(responseData)
+        if correctedClock || isRetryable(status) {
             let attempts = report.attempts + 1
-            let delay = retryDelay(attempt: attempts, jitter: Double.random(in: 0...1))
+            let delay = correctedClock && attempts <= 3
+                ? 1
+                : retryDelay(attempt: attempts, jitter: Double.random(in: 0...1))
             let nextAttemptAt = Date().addingTimeInterval(delay)
             // Keep an in-memory deadline as a fallback if protected storage is
             // temporarily unavailable; this prevents a tight retry loop.
@@ -1407,7 +1433,9 @@ public enum TrackHub {
             ) {
                 log("\(report.path) retry state could not be persisted")
             }
-            log("\(report.path) delivery failed — retrying with backoff")
+            log(correctedClock
+                ? "device clock corrected — retrying \(report.path)"
+                : "\(report.path) delivery failed — retrying with backoff")
             return
         }
 
@@ -1607,6 +1635,29 @@ public enum TrackHub {
         return status == 408 || status == 429 || status >= 500
     }
 
+    @_spi(Testing) public static func serverClockOffset(
+        responseData data: Data?,
+        localTimeMilliseconds: Int64
+    ) -> Int64? {
+        guard let data,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["error"] as? String == "clock_skew",
+              let number = object["server_time_ms"] as? NSNumber else { return nil }
+        let serverTime = number.int64Value
+        guard (1_577_836_800_000...4_102_444_800_000).contains(serverTime) else { return nil }
+        return serverTime - localTimeMilliseconds
+    }
+
+    private static func applyServerClock(_ data: Data?) -> Bool {
+        let localTime = Int64(Date().timeIntervalSince1970 * 1_000)
+        guard let offset = serverClockOffset(
+            responseData: data,
+            localTimeMilliseconds: localTime
+        ) else { return false }
+        clockOffsetMilliseconds = offset
+        return true
+    }
+
     private static func currentNetworkConfig() -> NetworkConfig? {
         guard let config else { return nil }
         return NetworkConfig(
@@ -1620,7 +1671,7 @@ public enum TrackHub {
         config: NetworkConfig,
         path: String,
         bodyData: Data,
-        completion: @escaping (Int?) -> Void
+        completion: @escaping (Int?, Data?) -> Void
     ) {
         let url = config.endpoint.appendingPathComponent("ingest").appendingPathComponent(config.ingestToken).appendingPathComponent(path)
         var request = URLRequest(url: url)
@@ -1629,7 +1680,8 @@ public enum TrackHub {
         request.setValue("TrackHub-iOS/\(Self.sdkVersion)", forHTTPHeaderField: "User-Agent")
         request.httpBody = bodyData
         if let secret = config.sdkSecret, !secret.isEmpty {
-            let ts = String(Int(Date().timeIntervalSince1970 * 1000))
+            let localTime = Int64(Date().timeIntervalSince1970 * 1_000)
+            let ts = String(localTime + clockOffsetMilliseconds)
             let scope = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             let message = "\(ts).\(config.ingestToken).\(scope).\(String(data: bodyData, encoding: .utf8) ?? "")"
             let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: Data(secret.utf8)))
@@ -1637,7 +1689,7 @@ public enum TrackHub {
             request.setValue("2", forHTTPHeaderField: "X-TrackHub-Signature-Version")
             request.setValue(mac.map { String(format: "%02x", $0) }.joined(), forHTTPHeaderField: "X-TrackHub-Signature")
         }
-        httpClient.data(for: request) { status, _ in completion(status) }
+        httpClient.data(for: request, completion: completion)
     }
 
     static func log(_ message: String) {
