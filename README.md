@@ -1,8 +1,9 @@
 # TrackHub iOS SDK
 
 > **Текущая версия:** `1.10.2` · **минимальная iOS:** 14 · **проверено:** 7 августа 2026 г.
-> Полная документация платформы: [`docs/README.md`](../docs/README.md). Пошаговое подключение:
-> [`INTEGRATION.md`](INTEGRATION.md).
+> Полная документация платформы: [TrackHub docs](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/README.md).
+> Пошаговое подключение: [`INTEGRATION.md`](INTEGRATION.md).
+> Общий iOS/Android rollout: [SDK Integration Guide](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_INTEGRATION_GUIDE.md).
 
 Lightweight Swift package: install/session reporting, Google click context and
 remote-controlled SKAdNetwork and AdAttributionKit conversion values

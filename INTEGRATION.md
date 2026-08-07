@@ -1,12 +1,14 @@
-# TrackHub iOS SDK — Integration Guide
+# TrackHub iOS SDK — подробное руководство по внедрению
 
 > **Версия инструкции:** TrackHub iOS SDK `1.10.2`, iOS 14+, проверено 7 августа 2026 г.
-> Контракты сервера: [`docs/SDK_CONTRACT.md`](../docs/SDK_CONTRACT.md); диагностика платформы:
-> [`docs/TROUBLESHOOTING.md`](../docs/TROUBLESHOOTING.md).
+> Общая архитектура: [TrackHub SDK Integration Guide](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_INTEGRATION_GUIDE.md)
+> Контракт сервера: [SDK_CONTRACT.md](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_CONTRACT.md)
+> Диагностика: [TROUBLESHOOTING.md](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/TROUBLESHOOTING.md)
 
-A complete, copy‑paste walkthrough for adding the TrackHub SDK to a **native iOS (Swift)**
-app. Hand this to whoever owns the app's Xcode project. The integration keeps Apphud as the
-financial source of truth while TrackHub owns attribution and product-event delivery.
+Это самостоятельная copy-paste инструкция для разработчика **native iOS-приложения на Swift**.
+Она описывает установку package, порядок инициализации, Apphud, backend callbacks, ATT/consent,
+deep links, события, покупки, APNs, Test Lab, outage и production release. Apphud/S2S остаётся
+финансовым источником истины; TrackHub отвечает за measurement, attribution и доставку событий.
 
 > The exact values you need (`endpoint`, `ingestToken`, and `sdkSecret` if SDK Signature is on)
 > are pre‑filled for your app in the TrackHub web UI:
@@ -15,7 +17,7 @@ financial source of truth while TrackHub owns attribution and product-event deli
 
 ---
 
-## What the SDK does (and does not do)
+## Что SDK делает и чего не делает
 
 | Concern | Handled by |
 | --- | --- |
@@ -38,7 +40,7 @@ Conversion API path and is not Firebase.
 
 ---
 
-## Prerequisites
+## Предварительные требования
 
 - **iOS 14.0+** deployment target (the package requires it).
 - The app already exists in TrackHub with **platform = iOS** (so it has an ingest token).
@@ -48,6 +50,36 @@ Conversion API path and is not Firebase.
   TrackHub with a linked S2S connection. Its secret stays on that backend.
 - A **real device** for release QA. AdAttributionKit/SKAN postbacks are not a
   simulator-level end-to-end attribution test.
+
+До изменения Xcode-проекта назначьте владельцев следующих частей:
+
+- mobile initialization и event instrumentation;
+- Apphud identity;
+- backend proxy для attribution/erasure;
+- consent/ATT UI;
+- Universal Links и app routing;
+- APNs connection и environment;
+- QA Test Lab run и live canary;
+- privacy review и App Store Connect disclosures.
+
+## Рекомендуемый порядок запуска
+
+На cold start соблюдайте один порядок:
+
+1. передайте launch URL в `TrackHub.handleDeepLink`, если он уже доступен;
+2. восстановите ранее принятое Consent Mode/PIPL state;
+3. запустите Apphud с выбранным stable custom user id;
+4. получите optional Firebase app instance id / Google ODM info, но не блокируйте launch
+   бесконечно;
+5. вызовите `TrackHub.configure`;
+6. передайте APNs token, если он уже известен;
+7. после собственного contextual explanation отдельно запросите ATT;
+8. вызывайте funnel helpers на фактических UI boundaries;
+9. после verified StoreKit purchase передайте transaction identity.
+
+Для Apphud-приложения не полагайтесь на fallback `userId`: первый install snapshot может быть
+зафиксирован раньше позднего `setUserId`. Получите один и тот же custom user id в Apphud и
+TrackHub до первой конфигурации.
 
 ---
 
@@ -89,6 +121,31 @@ forgery, it is not a hard guarantee).
 
 Order matters: start Apphud first so `Apphud.userID()` returns the real id, then configure
 TrackHub.
+
+### Полный контракт `configure`
+
+| Параметр | Обязателен | Значение и ограничения |
+|---|---:|---|
+| `endpoint` | да | HTTPS origin, например `https://postbacks.daively.com`, без `/ingest/...` |
+| `ingestToken` | да | token конкретного TrackHub app |
+| `userId` | рекомендуется | тот же stable custom user id, что передан Apphud |
+| `sdkSecret` | для signed app/purchase | app SDK secret; это не backend S2S token |
+| `firebaseAppInstanceId` | нет | GA4/Firebase join key, если Firebase уже используется |
+| `googleOnDeviceMeasurementInfo` | нет | opaque `odm_info` standalone Google iOS SDK, максимум 4096 bytes |
+| `countryCode` | рекомендуется | фактический ISO-3166 alpha-2 country, не Locale language |
+| `debug` | только QA | безопасные status logs без credentials |
+| `integrationTestToken` | только QA | short-lived Test Lab token, никогда не production |
+| `attConsentWaitingInterval` | нет | ожидание первого ATT result, `0` выключает, максимум 360 сек. |
+| `enableLegacyAsaAttribution` | обычно нет | dormant legacy contour; включать только вместе с backend flag |
+| `apphudDeviceIdentifiersHandler` | рекомендуется | официальный Apphud IDFV/IDFA adapter |
+| `backendAttributionProvider` | для attribution | authenticated host-backend proxy, возвращающий raw JSON `Data` |
+| `backendPrivacyErasureHandler` | для erase | authenticated host-backend proxy, возвращающий `true` только после TrackHub `2xx` |
+| `apphudAttributionHandler` | для Apphud bridge | custom attribution adapter с acknowledgement |
+| `attributionChangedHandler` | нет | обновление app state/UI при новой revision |
+| `deferredDeepLinkHandler` | совместимость API | iOS сейчас fail-closed возвращает `nil`; probabilistic matching отсутствует |
+
+SDK отклоняет plaintext HTTP, кроме `localhost`/`127.0.0.1` для локальной разработки. Передавайте
+origin целиком и не конструируйте `/ingest/{token}` вручную.
 
 ### SwiftUI (`@main App`)
 
@@ -223,6 +280,78 @@ main thread, даже если host вызвал `configure` из background que
 лимитов самые старые второстепенные события могут быть вытеснены. Следите за Data Health и
 проводите отдельный canary после восстановления сервера.
 
+### Backend callbacks: обязательный security-контракт
+
+`backendAttributionProvider` и `backendPrivacyErasureHandler` не должны обращаться к TrackHub
+прямо из приложения. Их задача — вызвать собственный authenticated backend приложения. Только
+backend хранит linked S2S token и вызывает TrackHub.
+
+Attribution request backend → TrackHub:
+
+```http
+POST /ingest/{ingestToken}/sdk/attribution HTTP/1.1
+Host: postbacks.daively.com
+Content-Type: application/json
+X-TrackHub-Token: <linked S2S secret>
+
+{
+  "user_id": "stable_app_user_id",
+  "event_at": "2026-08-07T09:15:00Z"
+}
+```
+
+Privacy request backend → TrackHub:
+
+```http
+POST /ingest/{ingestToken}/sdk/forget-device HTTP/1.1
+Host: postbacks.daively.com
+Content-Type: application/json
+X-TrackHub-Token: <linked S2S secret>
+
+{
+  "user_id": "stable_app_user_id",
+  "reason": "user_requested"
+}
+```
+
+Backend должен выводить разрешённый `user_id` из authenticated session, а не доверять
+произвольному значению из mobile body. S2S token нельзя возвращать приложению, помещать в remote
+config или логировать. Для attribution верните SDK raw JSON `Data`; для erase верните `true`
+только после `200 {"ok":true}` от TrackHub.
+
+Пример границы host app:
+
+```swift
+enum AppBackend {
+    static func fetchTrackHubAttribution(
+        userId: String,
+        completion: @escaping (Data?) -> Void
+    ) {
+        // Ваш API сам сверяет userId с authenticated user session.
+        MobileAPI.fetchTrackHubAttribution(
+            onSuccess: { responseData in completion(responseData) },
+            onFailure: { completion(nil) }
+        )
+    }
+
+    static func eraseTrackHubUser(
+        userId: String,
+        reason: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        MobileAPI.eraseTrackHubUser(
+            reason: reason,
+            onSuccess: { completion(true) },
+            onFailure: { completion(false) }
+        )
+    }
+}
+```
+
+Каждый callback завершайте ровно один раз и не выполняйте synchronous network call на main
+thread. SDK имеет watchdog 15 секунд, но host app всё равно должен использовать собственные
+bounded timeouts и response-size limits.
+
 The Apphud handlers use the current official `setDeviceIdentifiers` and `setAttribution` APIs
 that Apphud documents for MMPs such as Adjust. `AppBackend` authenticates the signed-in user,
 calls TrackHub `/sdk/attribution` with the linked S2S connection's
@@ -316,6 +445,15 @@ TrackHub.trackEvent("level_complete")
 TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
 ```
 
+Рекомендуйте стабильные lowercase `snake_case` names. `callbackParams` и `partnerParams` должны
+быть JSON-serializable и bounded: string/number/bool и небольшие массивы/словари простых типов.
+Не передавайте `Double.nan`, infinity, `UIView`, `Error`, files/binary data, credentials, email,
+phone, full name, price или currency. Максимальный SDK payload — 64 KiB.
+
+Если событие явно mapped в Google App Conversion, безопасные primitive `callbackParams` могут
+быть allowlist-forwarded в `app_event_data`. `partnerParams` остаются внутри TrackHub. Не кладите
+туда поля «на всякий случай»: сначала определите владельца, срок хранения и consumer каждого поля.
+
 `track(…)` (without "Event") still exists for **SKAN‑only** conversion values — it does not send
 analytics. Prefer `trackEvent` for everything new. Events are persisted before delivery and drain one
 at a time with bounded backoff, including across later launches, so a flaky network never drops them.
@@ -341,6 +479,165 @@ the join or a 72-hour TTL. `sdkSecret` is mandatory for this endpoint.
 
 ---
 
+## Step 6 — Deep links и рекламные click references
+
+Передавайте SDK каждый cold/warm URL, который может содержать Google `gclid`/`gbraid`/`wbraid`,
+OpenAI Ads `oppref` или AdAttributionKit re-engagement context. Host app остаётся владельцем
+обычного navigation routing: `handleDeepLink` сохраняет measurement context, но не открывает экран.
+
+SwiftUI:
+
+```swift
+@main
+struct ExampleApp: App {
+    var body: some Scene {
+        WindowGroup { ContentView() }
+            .onOpenURL { url in
+                _ = TrackHub.handleDeepLink(url)
+                _ = TrackHub.handleAdAttributionReengagement(url)
+                AppRouter.route(url)
+            }
+    }
+}
+```
+
+UIKit custom scheme:
+
+```swift
+func application(
+    _ app: UIApplication,
+    open url: URL,
+    options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+) -> Bool {
+    _ = TrackHub.handleDeepLink(url)
+    _ = TrackHub.handleAdAttributionReengagement(url)
+    return AppRouter.route(url)
+}
+```
+
+UIKit Universal Link:
+
+```swift
+func application(
+    _ application: UIApplication,
+    continue userActivity: NSUserActivity,
+    restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+) -> Bool {
+    guard let url = userActivity.webpageURL else { return false }
+    _ = TrackHub.handleDeepLink(url)
+    _ = TrackHub.handleAdAttributionReengagement(url)
+    return AppRouter.route(url)
+}
+```
+
+Если launch URL уже известен до `configure`, сначала передайте его TrackHub, чтобы click reference
+попал в самый ранний install/session report. На warm link SDK форсирует отдельную re-engagement
+session.
+
+Для AdAttributionKit сохраните returned conversion tag и передавайте его событиям, которые должны
+обновить конкретное overlapping re-engagement window:
+
+```swift
+let tag = TrackHub.handleAdAttributionReengagement(url)
+
+TrackHub.trackEvent(
+    "offer_accepted",
+    adAttributionTarget: .reengagement,
+    conversionTag: tag
+)
+```
+
+iOS SDK намеренно не возвращает user-specific deferred private path через IP/User-Agent
+fingerprinting. `resolveDeferredDeepLink` на iOS fail-closed завершится с `nil`, пока не появится
+детерминированный App Store hand-off. Не стройте routing, который зависит от probabilistic match.
+
+---
+
+## Step 7 — APNs token и uninstall measurement
+
+TrackHub не вызывает `registerForRemoteNotifications` и не показывает notification permission.
+Host app регистрирует APNs обычным способом и передаёт полученный token:
+
+```swift
+func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+) {
+    #if DEBUG
+    TrackHub.setPushToken(deviceToken, environment: .sandbox)
+    #else
+    TrackHub.setPushToken(deviceToken, environment: .production)
+    #endif
+}
+
+func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: Error
+) {
+    // Логируйте тип ошибки без token/credentials и не блокируйте TrackHub init.
+}
+```
+
+TestFlight/App Store используют production APNs environment; локальная debug-сборка обычно
+использует sandbox. Если environments смешаны, provider может считать token invalid.
+
+SDK сохраняет последний token и повторно отправляет его после `configure`. В TrackHub свяжите
+APNs connection с тем же iOS app. Timeout или generic APNs error не считаются uninstall: нужен
+явный provider response о невалидной регистрации.
+
+---
+
+## Step 8 — Attribution state, смена identity и privacy erase
+
+Получение attribution snapshot:
+
+```swift
+TrackHub.getAttribution { attribution in
+    guard let attribution else {
+        // Backend может быть временно недоступен; nil не равен organic.
+        return
+    }
+
+    analytics.setAcquisitionChannel(attribution.channel)
+    if let campaignId = attribution.campaignId {
+        analytics.setCampaignId(campaignId)
+    }
+}
+```
+
+`attributionChangedHandler` из `configure` подходит для обновления app state при новой revision.
+Не используйте attribution как authentication/authorization: это measurement metadata.
+
+Если stable account id становится известен после login:
+
+```swift
+func didResolveAuthenticatedUser(_ stableUserId: String) {
+    ApphudBridge.updateUser(stableUserId)
+    TrackHub.setUserId(stableUserId)
+}
+```
+
+Предпочтительно иметь правильный Apphud id до первого `configure`; поздний `setUserId` не должен
+быть штатным способом исправления уже созданного install snapshot.
+
+Privacy erasure:
+
+```swift
+TrackHub.forgetDevice(reason: "user_requested") { accepted in
+    if accepted {
+        privacyView.showCompleted()
+    } else {
+        privacyView.showRetryableError()
+    }
+}
+```
+
+SDK очищает queue/identifiers и отключает дальнейший tracking только после подтверждения host
+backend. `false` означает, что erase не доказан; не показывайте пользователю ложный success.
+После успешного erase повторный `configure` с тем же app token не включает tracking обратно.
+
+---
+
 ## Permissions / Info.plist
 
 - Add **Privacy - Tracking Usage Description** (`NSUserTrackingUsageDescription`) with the
@@ -353,10 +650,18 @@ the join or a 72-hour TTL. `sdkSecret` is mandatory for this endpoint.
   remains responsible for its combined TrackHub + Apphud + ad-network behavior.
 - App Transport Security is satisfied (`https://postbacks.daively.com`); the SDK refuses any
   non‑HTTPS endpoint except `localhost`.
+- Для Universal Links добавьте Associated Domains и поддерживайте корректный AASA-файл на своём
+  домене. TrackHub SDK не меняет entitlements host app автоматически.
+- Для AdAttributionKit postback copies добавьте `AttributionCopyEndpoint` со значением origin,
+  показанным в TrackHub Setup. Для re-engagement copies включите
+  `EligibleForAdAttributionKitReengagementPostbackCopies`. Проверяйте эти keys на поддерживаемой
+  версии iOS и в release entitlement/config, а не только на Simulator.
+- Package содержит TrackHub privacy manifest, но App Store Connect answers должны описывать
+  совокупное поведение TrackHub, Apphud, Firebase и рекламных SDK host application.
 
 ---
 
-## Step 6 — Verify it works
+## Step 9 — Verify it works
 
 For the authoritative workflow, open **TrackHub → app → Setup → Integration Test Lab**,
 start an isolated run and pass its short-lived token only in the QA build:
@@ -406,7 +711,40 @@ the app's data).
 | Legacy ASA attribution is absent | Expected by default. Re-enable both SDK `enableLegacyAsaAttribution` and backend `ENABLE_LEGACY_ASA_PROCESSING` only for an intentional rollback. |
 | `track(…) before schema is available` | Called before the first schema fetch finished; harmless — the next launch caches the schema. Schema also persists across launches once fetched. |
 | TrackHub server is offline | Expected behavior: the host app continues normally, and reports remain in the bounded queue. Restore the endpoint, foreground/relaunch the app and verify that the queue drains in Test Lab/Data Health. |
+| `401 clock_skew` | Device wall clock differs by more than five minutes. SDK keeps the report, accepts only a sane TrackHub `server_time_ms`, corrects process-local signing time and retries. Do not change the user's system clock programmatically. |
 | Repeating `rejected with HTTP 4xx — not retried` | This is a permanent configuration/contract failure, not a transient outage. Check endpoint, ingest token, SDK secret/signature and server/SDK version compatibility. |
+| Universal Link opens the app but attribution is absent | Call `handleDeepLink` for both cold and warm URLs; verify query item survives redirects and Associated Domains/AASA are valid. |
+| `resolveDeferredDeepLink` returns `nil` on iOS | Expected: deterministic private deferred-path hand-off is Android-only. iOS does not use IP/UA matching. |
+| APNs token is rejected | Check `.sandbox` vs `.production`, bundle id/topic and linked TrackHub APNs connection. TestFlight uses production. |
+| Purchase waits for context | Confirm `sdkSecret`, verified StoreKit transaction id and exact match with Apphud transaction. Never substitute a random UUID. |
+| `forgetDevice` returns `false` | Host backend callback missing, timed out or TrackHub erase was not accepted. Check authenticated backend and linked S2S token. |
+
+---
+
+## Production checklist
+
+- [ ] Package закреплён на `1.10.2`, а не moving branch.
+- [ ] iOS deployment target не ниже 14.
+- [ ] Production endpoint содержит только HTTPS origin.
+- [ ] Ingest token и SDK secret принадлежат правильному iOS app.
+- [ ] Linked S2S token отсутствует в binary, logs и mobile responses.
+- [ ] Apphud стартует первым и использует тот же stable custom user id.
+- [ ] Backend attribution/erase endpoints проверяют authenticated user.
+- [ ] Consent allow/deny и ATT authorized/denied проверены отдельно.
+- [ ] `NSUserTrackingUsageDescription` согласован продуктом/privacy owner.
+- [ ] Universal Links, custom scheme и warm link обработаны.
+- [ ] Associated Domains/AASA проверены на release build.
+- [ ] SKAN/AdAttributionKit Info.plist keys и conversion schema проверены.
+- [ ] Funnel helpers стоят на фактических UI boundaries.
+- [ ] Custom events не содержат PII, secrets или client-authored revenue.
+- [ ] StoreKit transaction id совпадает с Apphud webhook.
+- [ ] APNs sandbox/production environment выбран правильно.
+- [ ] Offline endpoint не блокирует launch/UI, reports появляются после восстановления.
+- [ ] Swift contract suite и iOS Simulator build зелёные.
+- [ ] Consumer app собран в Debug и Release/TestFlight configuration.
+- [ ] Shadow Integration Test Lab полностью пройден.
+- [ ] Live canary имеет отдельное явное разрешение.
+- [ ] Test Lab token и `debug: true` удалены из production build.
 
 ---
 
