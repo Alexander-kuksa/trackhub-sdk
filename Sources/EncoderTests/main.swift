@@ -7,6 +7,18 @@ import CryptoKit
 
 var failures = 0
 
+func sdkKey(endpoint: String, ingestToken: String, sdkSecret: String) -> String {
+    let data = try! JSONSerialization.data(withJSONObject: [
+        "e": endpoint,
+        "i": ingestToken,
+        "s": sdkSecret,
+    ])
+    return "thcfg_v1_" + data.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+}
+
 func check(_ condition: Bool, _ name: String) {
     if condition {
         print("✓ \(name)")
@@ -131,6 +143,51 @@ let sigMac = HMAC<SHA256>.authenticationCode(for: Data(sigMsg.utf8), using: Symm
 let sigHex = sigMac.map { String(format: "%02x", $0) }.joined()
 check(sigHex == "48bd3ea5529853b246d18a578d1ce79aa50c2d3e7f69663b233bd696c5c8a91d",
       "SDK signature HMAC matches the server vector")
+
+let installCredential = "thic_v1_" + String(repeating: "A", count: 43)
+check(
+    InstallCredentialStore.isValid(installCredential),
+    "device-scoped install credential accepts the versioned server shape"
+)
+check(
+    !InstallCredentialStore.isValid("thic_v1_short")
+        && !InstallCredentialStore.isValid("thic_v2_" + String(repeating: "A", count: 43)),
+    "device-scoped install credential rejects malformed or unknown versions"
+)
+check(
+    InstallCredentialStore.account(ingestToken: "app-a", installUid: "install-1")
+        != InstallCredentialStore.account(ingestToken: "app-a", installUid: "install-2"),
+    "Keychain account is scoped to one installation without exposing the ingest token"
+)
+check(
+    TrackHub.shouldReportInstallForCredential(
+        installAlreadySent: true,
+        hasCredential: false,
+        lastAttempt: 1_000,
+        now: 1_100,
+        interval: 200
+    ) == false,
+    "new SDK against an old server throttles credential bootstrap"
+)
+check(
+    TrackHub.shouldReportInstallForCredential(
+        installAlreadySent: true,
+        hasCredential: false,
+        lastAttempt: 1_000,
+        now: 1_201,
+        interval: 200
+    ),
+    "upgraded SDK eventually retries the idempotent install ACK bootstrap"
+)
+check(
+    !TrackHub.shouldReportInstallForCredential(
+        installAlreadySent: true,
+        hasCredential: true,
+        lastAttempt: 0,
+        now: 10_000
+    ),
+    "credential receipt restores the one-install-report steady state"
+)
 
 check(TrackHub.normalizedCountryCode(" de ") == "DE",
       "explicit country code is normalized to ISO uppercase")
@@ -271,12 +328,16 @@ let outageDirectory = (FileManager.default.urls(for: .applicationSupportDirector
 let outageURL = outageDirectory.appendingPathComponent("trackhub_queue_\(outageNamespace).json")
 try? FileManager.default.removeItem(at: outageURL)
 let publicCallStarted = Date()
-TrackHub.configure(
-    endpoint: URL(string: "http://127.0.0.1:9")!,
-    ingestToken: "outage-test-ingest-token",
-    userId: "outage-test-user",
-    integrationTestToken: outageToken
+var outageConfig = TrackHubConfig(
+    sdkKey: sdkKey(
+        endpoint: "http://127.0.0.1:9",
+        ingestToken: "outage-test-ingest-token",
+        sdkSecret: "outage-test-sdk-secret"
+    ),
+    environment: .testLab(token: outageToken)
 )
+outageConfig.debugLogging = true
+MainActor.assumeIsolated { TrackHub.start(outageConfig) }
 TrackHub.trackEvent("invalid_payload", callbackParams: ["not_finite": Double.nan])
 for index in 0..<25 { TrackHub.trackEvent("offline_\(index)") }
 check(
@@ -396,6 +457,8 @@ check(purchaseBody["transaction_id"] as? String == "2000000123456789",
       "purchase context carries the stable transaction id")
 check(purchaseBody["product_id"] as? String == "com.example.monthly",
       "purchase context carries the product id")
+check((purchaseBody["install_uid"] as? String)?.isEmpty == false,
+      "purchase context carries the installation scope for device erasure")
 check(purchaseBody["first_open_at"] as? String == "2026-05-17T06:40:00Z",
       "purchase context carries the stable first-open timestamp required as fot")
 check(purchaseBody["revenue_cents"] == nil && purchaseBody["currency"] == nil,

@@ -78,7 +78,7 @@
       </array>
     </dict>
     <dict>
-      <!-- AdServices/click identifiers used for advertising measurement -->
+      <!-- bounded ad click identifiers used for advertising measurement -->
       <key>NSPrivacyCollectedDataType</key>
       <string>NSPrivacyCollectedDataTypeAdvertisingData</string>
       <key>NSPrivacyCollectedDataTypeLinked</key>

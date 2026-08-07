@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import ApphudSDK
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -20,32 +21,13 @@ import AdSupport
 /// AdAttributionKit conversion values (Conversion Hub), app sessions
 /// (DAU/WAU/MAU + retention) and custom events.
 ///
-/// ```swift
-/// TrackHub.configure(endpoint: URL(string: "https://postbacks.example.com")!,
-///                    ingestToken: "<token>", userId: Apphud.userID())
-/// TrackHub.trackEvent("level_complete")
-/// ```
+/// Start after `Apphud.start(...)` with the single app-specific SDK key copied
+/// from TrackHub. Apphud identity and attribution are bridged automatically.
 public enum AdAttributionConversionTarget: Sendable, Equatable {
     case all
     case install
     case reengagement
 }
-
-/// Adapter installed by the host app after Apphud starts. TrackHub has no hard
-/// dependency on ApphudSDK: pass `data` to `Apphud.setAttribution(..., .custom)`
-/// and call `completion(true)` only when Apphud acknowledges it.
-public typealias ApphudAttributionHandler = (
-    _ data: [String: String],
-    _ completion: @escaping (Bool) -> Void
-) -> Void
-
-/// Adapter for Apphud's official `setDeviceIdentifiers(idfa:idfv:)` method.
-/// TrackHub sends IDFV immediately after configuration and sends IDFA only when
-/// App Tracking Transparency is authorized.
-public typealias ApphudDeviceIdentifiersHandler = (
-    _ idfa: String?,
-    _ idfv: String?
-) -> Void
 
 public struct TrackHubAttribution: Sendable, Equatable {
     public let revision: String
@@ -60,25 +42,8 @@ public struct TrackHubAttribution: Sendable, Equatable {
     public let data: [String: String]
 }
 
-public typealias TrackHubAttributionChangedHandler = (TrackHubAttribution) -> Void
-public typealias TrackHubDeferredDeepLinkHandler = (String?) -> Void
-
-/// Supplies the raw TrackHub attribution JSON through the host app's trusted
-/// backend. That backend authenticates to `/sdk/attribution` with its linked
-/// S2S secret; the secret must never be embedded in the mobile app.
-public typealias TrackHubBackendAttributionProvider = (
-    _ userId: String,
-    _ completion: @escaping (Data?) -> Void
-) -> Void
-
-/// Requests privacy erasure through the host app's trusted backend. The
-/// backend calls `/sdk/forget-device` with its linked S2S secret and reports
-/// whether TrackHub accepted the erasure.
-public typealias TrackHubBackendPrivacyErasureHandler = (
-    _ userId: String,
-    _ reason: String,
-    _ completion: @escaping (Bool) -> Void
-) -> Void
+public typealias TrackHubAttributionChangedHandler = @Sendable (TrackHubAttribution) -> Void
+public typealias TrackHubDeferredDeepLinkHandler = @Sendable (String?) -> Void
 
 public enum TrackHubTrackingAuthorizationStatus: String, Sendable, Equatable {
     case notDetermined
@@ -111,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.11.0"
+    public static let sdkVersion = "2.0.0"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -131,7 +96,13 @@ public enum TrackHub {
     private static var deliveryCompletions: [String: (Int?) -> Void] = [:]
     private static var apphudAttributionFetchInFlight = false
     private static var attributionFetchGeneration: UInt64 = 0
-    private static var activeForgetRequests: Set<UUID> = []
+    private static let privacyStateLock = NSLock()
+    private static var privacyStopRequested = false
+    private static var configuredPrivacyKey: String?
+    private static var configuredIngestToken: String?
+    private static var privacyErasureInFlight = false
+    private static var privacyRetryWorkItem: DispatchWorkItem?
+    private static var privacyErasureCompletion: ((Bool) -> Void)?
     private static var currentAttributionSnapshot: TrackHubAttribution?
     // Accessed only on TrackHub.queue. UIKit device values are captured on the
     // main thread before configuration work enters the SDK state machine.
@@ -151,11 +122,6 @@ public enum TrackHub {
         let sdkSecret: String?
         let integrationTestToken: String?
         let attConsentWaitingInterval: TimeInterval
-        let legacyAsaAttributionEnabled: Bool
-        let apphudDeviceIdentifiersHandler: ApphudDeviceIdentifiersHandler?
-        let backendAttributionProvider: TrackHubBackendAttributionProvider?
-        let backendPrivacyErasureHandler: TrackHubBackendPrivacyErasureHandler?
-        let apphudAttributionHandler: ApphudAttributionHandler?
         let attributionChangedHandler: TrackHubAttributionChangedHandler?
         let deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
     }
@@ -174,6 +140,7 @@ public enum TrackHub {
     private static let firstOpenAtKey = "trackhub.first_open_at"
     private static let deviceIdKey = "trackhub.device_id"
     private static let installUidKey = "trackhub.install_uid"
+    private static let installCredentialBootstrapKeyPrefix = "trackhub.install_credential_bootstrap."
     private static let pushTokenKey = "trackhub.push_token.apns"
     private static let pushEnvironmentKey = "trackhub.push_environment.apns"
     private static let gclidKey = "trackhub.gclid"
@@ -194,7 +161,9 @@ public enum TrackHub {
     private static let adsMeasurementConsentKey = "trackhub.consent.ads_measurement"
     private static let adAttributionConversionTagKey = "trackhub.ad_attribution.conversion_tag"
     private static let apphudAttributionRevisionKeyPrefix = "trackhub.apphud_attribution_revision."
+    private static let apphudUserIdKeyPrefix = "trackhub.apphud_user_id."
     private static let privacyDisabledKeyPrefix = "trackhub.privacy_disabled."
+    private static let privacyPendingKeyPrefix = "trackhub.privacy_pending."
     private static let iso8601 = ISO8601DateFormatter()
     private static let callbackTimeout: TimeInterval = 15
     private static let maxReportBytes = EventQueue.defaultMaxItemBytes
@@ -203,86 +172,115 @@ public enum TrackHub {
 
     // MARK: - Public API
 
-    /// Call once on launch. Reports the install (first launch only), starts
-    /// session tracking, refreshes the schema and
-    /// flushes buffered offline reports. `userId` is OPTIONAL — a persistent
-    /// device id is generated when omitted, so the SDK needs no Apphud; set the
-    /// real id later with `setUserId`.
-    public static func configure(
-        endpoint: URL,
-        ingestToken: String,
-        userId: String? = nil,
-        sdkSecret: String? = nil,
-        firebaseAppInstanceId: String? = nil,
-        googleOnDeviceMeasurementInfo: String? = nil,
-        countryCode: String? = nil,
-        debug: Bool = false,
-        integrationTestToken: String? = nil,
-        attConsentWaitingInterval: TimeInterval = 0,
-        enableLegacyAsaAttribution: Bool = false,
-        apphudDeviceIdentifiersHandler: ApphudDeviceIdentifiersHandler? = nil,
-        backendAttributionProvider: TrackHubBackendAttributionProvider? = nil,
-        backendPrivacyErasureHandler: TrackHubBackendPrivacyErasureHandler? = nil,
-        apphudAttributionHandler: ApphudAttributionHandler? = nil,
-        attributionChangedHandler: TrackHubAttributionChangedHandler? = nil,
-        deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler? = nil
-    ) {
-        // Refuse plaintext HTTP (token in transit + MITM schema poisoning); allow localhost for dev.
-        guard endpoint.scheme == "https" || endpoint.host == "localhost" || endpoint.host == "127.0.0.1" else {
-            print("[TrackHub] refusing non-HTTPS endpoint \(endpoint) — SDK not configured")
+    /// Start TrackHub once after `Apphud.start(...)`. The versioned `sdkKey`
+    /// contains this app's endpoint and ingest credentials; it is never logged.
+    @MainActor
+    public static func start(_ configuration: TrackHubConfig) {
+        if case .testLab = configuration.environment,
+           configuration.environment.testToken == nil {
+            print("[TrackHub] invalid Test Lab token — SDK not started")
             return
         }
-        let applyConfiguration: (String?) -> Void = { capturedIdfv in
+        guard let decoded = DecodedTrackHubSdkKey.decode(configuration.sdkKey) else {
+            print("[TrackHub] invalid sdkKey — SDK not started")
+            return
+        }
+        let endpoint = decoded.endpoint
+        let ingestToken = decoded.ingestToken
+        let sdkSecret = decoded.sdkSecret
+        // Publish the privacy namespace synchronously. A host is allowed to
+        // call gdprForgetMe() immediately after start(), before the main-actor
+        // Apphud snapshot and the serial configuration block have completed.
+        privacyStateLock.lock()
+        configuredPrivacyKey = privacyDisabledKey(token: ingestToken)
+        configuredIngestToken = ingestToken
+        privacyStateLock.unlock()
+        // Refuse plaintext HTTP (token in transit + MITM schema poisoning); allow localhost for dev.
+        guard endpoint.scheme == "https" || endpoint.host == "localhost" || endpoint.host == "127.0.0.1" else {
+            print("[TrackHub] refusing non-HTTPS endpoint \(endpoint) — SDK not started")
+            return
+        }
+        let applyConfiguration: (String?, String) -> Void = { capturedIdfv, capturedApphudUserId in
           queue.async {
             identifierForVendorSnapshot = capturedIdfv
-            let testToken = integrationTestToken?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let apphudUserId = capturedApphudUserId.trimmingCharacters(in: .whitespacesAndNewlines)
             config = Config(
                 endpoint: endpoint,
                 ingestToken: ingestToken,
-                userId: userId ?? resolveDeviceId(),
+                userId: apphudUserId.isEmpty ? resolveDeviceId() : apphudUserId,
                 sdkSecret: sdkSecret,
-                integrationTestToken: (testToken?.count ?? 0) >= 20 ? testToken : nil,
-                attConsentWaitingInterval: normalizedATTConsentWaitingInterval(attConsentWaitingInterval),
-                legacyAsaAttributionEnabled: enableLegacyAsaAttribution,
-                apphudDeviceIdentifiersHandler: apphudDeviceIdentifiersHandler,
-                backendAttributionProvider: backendAttributionProvider,
-                backendPrivacyErasureHandler: backendPrivacyErasureHandler,
-                apphudAttributionHandler: apphudAttributionHandler,
-                attributionChangedHandler: attributionChangedHandler,
-                deferredDeepLinkHandler: deferredDeepLinkHandler
+                integrationTestToken: configuration.environment.testToken,
+                attConsentWaitingInterval: normalizedATTConsentWaitingInterval(configuration.attConsentWaitingInterval),
+                attributionChangedHandler: configuration.attributionChangedHandler,
+                deferredDeepLinkHandler: configuration.deferredDeepLinkHandler
             )
-            trackingDisabled = UserDefaults.standard.bool(
-                forKey: privacyDisabledKey(token: ingestToken)
-            )
-            debugLogging = debug
-            if trackingDisabled {
-                log("tracking disabled after a forget-device request")
-                return
-            }
-            if let aii = firebaseAppInstanceId, !aii.isEmpty {
-                UserDefaults.standard.set(aii, forKey: appInstanceIdKey)
-            }
-            if let info = boundedOdmInfo(googleOnDeviceMeasurementInfo) {
-                UserDefaults.standard.set(info, forKey: odmInfoKey)
-            }
-            if let country = normalizedCountryCode(countryCode) {
+            persistGoogleAdsConsent(configuration.googleAdsConsent)
+            persistPIPLConsent(configuration.piplConsent)
+            if let country = normalizedCountryCode(configuration.countryCode) {
                 UserDefaults.standard.set(country, forKey: countryCodeKey)
             }
-            _ = resolveFirstOpenAt()
-            schema = loadCachedSchema()
-            sessionTracker = sessionTracker ?? SessionTracker()
-            // Test Lab reports must never drain the production offline queue.
-            // Keep the same in-memory instance for repeated configure calls in
-            // one namespace so a stale instance cannot overwrite newer state.
-            retryWorkItem?.cancel()
-            retryWorkItem = nil
-            retryDeadline = nil
-            transientRetryNotBefore = nil
+            var pendingPrivacyErasure = loadPendingErasure(token: ingestToken)
+            let persistedPrivacyStop = UserDefaults.standard.bool(
+                forKey: privacyDisabledKey(token: ingestToken)
+            )
+            // Recover the narrow crash window between persisting the local
+            // stop and committing its erasure job. A confirmed erasure has
+            // already removed installUid, so it is not recreated.
+            if persistedPrivacyStop, pendingPrivacyErasure == nil,
+               let retainedInstallUid = UserDefaults.standard.string(forKey: installUidKey),
+               !retainedInstallUid.isEmpty,
+               persistPendingErasure(
+                    installUid: retainedInstallUid,
+                    reason: "user_requested",
+                    token: ingestToken
+               ) {
+                pendingPrivacyErasure = loadPendingErasure(token: ingestToken)
+            }
+            let pendingPrivacyStateExists = hasPendingErasureState(token: ingestToken)
+            privacyStateLock.lock()
+            configuredPrivacyKey = privacyDisabledKey(token: ingestToken)
+            configuredIngestToken = ingestToken
+            privacyStopRequested = privacyStopRequested
+                || persistedPrivacyStop
+                || pendingPrivacyStateExists
+            privacyStateLock.unlock()
+            trackingDisabled = privacyStopRequested
+            debugLogging = configuration.debugLogging
+            // Load the durable queue before the privacy gate: if the process
+            // crashed immediately after gdprForgetMe(), the next launch must
+            // still remove already-buffered reports before any retry.
             let namespace = offlineQueueNamespace(for: config?.integrationTestToken)
             if eventQueue == nil || eventQueueNamespace != namespace {
                 eventQueue = EventQueue(url: queueFileURL(testToken: config?.integrationTestToken))
                 eventQueueNamespace = namespace
             }
+            if trackingDisabled {
+                log("tracking disabled after a privacy erasure request")
+                stopAndClearLocalMeasurement(retainingInstallUid: pendingPrivacyErasure?.installUid)
+                // Register lifecycle observation without starting network work
+                // inside this configuration turn. If gdprForgetMe raced start,
+                // its already-enqueued state block must install the completion
+                // before the erasure can finish.
+                startSessionTracking(beginForeground: false)
+                queue.async { retryPendingErasure() }
+                return
+            }
+            if let aii = configuration.firebaseAppInstanceId, !aii.isEmpty {
+                UserDefaults.standard.set(aii, forKey: appInstanceIdKey)
+            }
+            if let info = boundedOdmInfo(configuration.googleOnDeviceMeasurementInfo) {
+                UserDefaults.standard.set(info, forKey: odmInfoKey)
+            }
+            _ = resolveFirstOpenAt()
+            schema = loadCachedSchema()
+            sessionTracker = sessionTracker ?? SessionTracker()
+            // Test Lab reports must never drain the production offline queue.
+            // Keep the same in-memory instance for repeated start calls in
+            // one namespace so a stale instance cannot overwrite newer state.
+            retryWorkItem?.cancel()
+            retryWorkItem = nil
+            retryDeadline = nil
+            transientRetryNotBefore = nil
             startATTConsentDelayIfNeeded()
             publishApphudDeviceIdentifiers()
             if config?.integrationTestToken == nil {
@@ -290,6 +288,9 @@ public enum TrackHub {
                 applyLocalInstallConversionRule()
             }
             reportInstallIfNeeded()
+            if !apphudUserId.isEmpty {
+                syncApphudIdentityIfNeeded(apphudUserId)
+            }
             reportPushTokenIfAvailable()
             fetchAttributionIfNeeded()
             resolveDeferredDeepLinkIfNeeded()
@@ -298,31 +299,17 @@ public enum TrackHub {
             flush()
           }
         }
+        // Both Apphud.userID() and UIDevice.current are main-actor isolated.
+        // Capture them before returning so calls immediately following start()
+        // are ordered behind configuration on TrackHub's serial state queue.
         #if os(iOS)
-        if Thread.isMainThread {
-            applyConfiguration(UIDevice.current.identifierForVendor?.uuidString)
-        } else {
-            // `UIDevice.current` is main-thread isolated on modern SDKs. Keep
-            // configure non-blocking while preserving ordering: the state
-            // machine starts only after the snapshot has been captured.
-            DispatchQueue.main.async {
-                applyConfiguration(UIDevice.current.identifierForVendor?.uuidString)
-            }
-        }
+        applyConfiguration(
+            UIDevice.current.identifierForVendor?.uuidString,
+            Apphud.userID()
+        )
         #else
-        applyConfiguration(nil)
+        applyConfiguration(nil, Apphud.userID())
         #endif
-    }
-
-    /// Update the user id after configure (e.g. once the billing SDK resolves it).
-    public static func setUserId(_ userId: String) {
-        queue.async {
-            guard !userId.isEmpty else { return }
-            config?.userId = userId
-            reportPushTokenIfAvailable()
-            fetchAttributionIfNeeded()
-            syncServerConversionValue()
-        }
     }
 
     /// Forward the APNs registration token supplied by the host app. TrackHub
@@ -342,6 +329,7 @@ public enum TrackHub {
         _ deviceToken: String,
         environment: TrackHubPushEnvironment = .production
     ) {
+        guard !isPrivacyStopRequested() else { return }
         let value = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.count >= 32, value.count <= 4096 else { return }
         UserDefaults.standard.set(value, forKey: pushTokenKey)
@@ -349,16 +337,12 @@ public enum TrackHub {
         queue.async { reportPushTokenIfAvailable() }
     }
 
-    /// Retry the TrackHub → Apphud bridge on demand (normally configure,
-    /// install/session success and setUserId trigger it automatically).
-    public static func refreshApphudAttribution() {
-        queue.async { fetchAttributionIfNeeded() }
-    }
-
+    /// Retry the TrackHub → Apphud bridge on demand (normally start and
+    /// install/session success trigger it automatically).
     /// Returns the durable TrackHub attribution snapshot. The completion is
     /// always delivered on the main queue. A network refresh is made when the
     /// current process has not fetched a snapshot yet.
-    public static func getAttribution(
+    public static func attribution(
         completion: @escaping (TrackHubAttribution?) -> Void
     ) {
         queue.async {
@@ -377,68 +361,71 @@ public enum TrackHub {
         queue.async { resolveDeferredDeepLinkIfNeeded(completion: completion) }
     }
 
-    /// Permanently erases this app/user identity through the host app's trusted
-    /// backend and disables subsequent SDK delivery for this install only after
-    /// the backend confirms TrackHub accepted the request.
-    public static func forgetDevice(
+    /// Immediately stops local tracking and durably schedules erasure of this
+    /// installation. Offline/server failures are retried on launch/foreground;
+    /// tracking never resumes because a network request failed.
+    public static func gdprForgetMe(
         reason: String = "user_requested",
         completion: ((Bool) -> Void)? = nil
     ) {
+        privacyStateLock.lock()
+        privacyStopRequested = true
+        let disabledKey = configuredPrivacyKey
+        let ingestToken = configuredIngestToken
+        privacyStateLock.unlock()
+        let boundedReason = String(reason.prefix(256))
+        let preparedInstallUid: String?
+        let preparedDurably: Bool
+        if let disabledKey, let ingestToken {
+            let installUid = resolveInstallUid()
+            UserDefaults.standard.set(true, forKey: disabledKey)
+            _ = UserDefaults.standard.synchronize()
+            preparedInstallUid = installUid
+            preparedDurably = persistPendingErasure(
+                installUid: installUid,
+                reason: boundedReason,
+                token: ingestToken
+            )
+        } else {
+            preparedInstallUid = nil
+            preparedDurably = false
+        }
         queue.async {
-            guard let config, let handler = config.backendPrivacyErasureHandler else {
-                log("forget-device requires backendPrivacyErasureHandler")
+            guard let config else {
+                // start() has decoded the key but its main-actor Apphud
+                // snapshot has not returned yet. Keep the completion pending;
+                // the start block will observe the durable job and retry it.
+                if preparedDurably {
+                    privacyErasureCompletion = completion
+                } else {
+                    DispatchQueue.main.async { completion?(false) }
+                }
+                return
+            }
+            let installUid = preparedInstallUid ?? resolveInstallUid()
+            trackingDisabled = true
+            UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
+            _ = UserDefaults.standard.synchronize()
+            if loadPendingErasure(token: config.ingestToken) == nil {
+                _ = persistPendingErasure(
+                    installUid: installUid,
+                    reason: boundedReason,
+                    token: config.ingestToken
+                )
+            }
+            stopAndClearLocalMeasurement(retainingInstallUid: installUid)
+            guard loadPendingErasure(token: config.ingestToken) != nil else {
+                privacyErasureCompletion = nil
                 return DispatchQueue.main.async { completion?(false) }
             }
-            let boundedReason = String(reason.prefix(256))
-            let requestID = UUID()
-            activeForgetRequests.insert(requestID)
-            let finish: (Bool) -> Void = { accepted in
-                queue.async {
-                    guard activeForgetRequests.remove(requestID) != nil else { return }
-                    if accepted {
-                        trackingDisabled = true
-                        UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
-                        currentAttributionSnapshot = nil
-                        retryWorkItem?.cancel()
-                        retryWorkItem = nil
-                        retryDeadline = nil
-                        transientRetryNotBefore = nil
-                        deliveryCompletions.removeAll()
-                        for key in [
-                            pushTokenKey, pushEnvironmentKey, deviceIdKey, installUidKey,
-                            gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
-                            openAiOpprefKey, pendingOpenAiOpprefKey,
-                            appInstanceIdKey, odmInfoKey,
-                        ] {
-                            UserDefaults.standard.removeObject(forKey: key)
-                        }
-                        if eventQueue?.removeAll() == false {
-                            log("forget-device could not erase the offline queue")
-                        }
-                    }
-                    DispatchQueue.main.async { completion?(accepted) }
-                }
-            }
-            queue.asyncAfter(deadline: .now() + callbackTimeout) {
-                guard activeForgetRequests.contains(requestID) else { return }
-                log("forget-device backend timed out")
-                finish(false)
-            }
-            DispatchQueue.main.async {
-                handler(config.userId, boundedReason, finish)
-            }
+            privacyErasureCompletion = completion
+            retryPendingErasure()
         }
-    }
-
-    /// Re-send the currently available identifiers to Apphud. Configuration
-    /// already does this once; the ATT completion also calls it automatically.
-    public static func syncApphudDeviceIdentifiers() {
-        queue.async { publishApphudDeviceIdentifiers() }
     }
 
     /// Present Apple's ATT prompt. Call this only after the app's contextual
     /// explanation, at the product-appropriate moment. It is intentionally not
-    /// shown automatically from `configure`, because launch-time permission
+    /// shown automatically from `start`, because launch-time permission
     /// prompts produce poor consent quality and make onboarding brittle.
     ///
     /// `NSUserTrackingUsageDescription` must be present in the host app's
@@ -447,6 +434,10 @@ public enum TrackHub {
     public static func requestAppTrackingTransparency(
         completion: ((TrackHubTrackingAuthorizationStatus) -> Void)? = nil
     ) {
+        guard !isPrivacyStopRequested() else {
+            DispatchQueue.main.async { completion?(.unavailable) }
+            return
+        }
         #if os(iOS) && canImport(AppTrackingTransparency) && canImport(AdSupport)
         DispatchQueue.main.async {
             let usage = Bundle.main.object(forInfoDictionaryKey: "NSUserTrackingUsageDescription") as? String
@@ -547,20 +538,21 @@ public enum TrackHub {
     /// the GA4/Firebase join key. TrackHub persists it on the install and stamps
     /// it on conversions it forwards to GA4 so a server-confirmed subscription
     /// attributes to the right install/campaign. TrackHub does NOT depend on
-    /// Firebase — the host app passes the id in. Call BEFORE `configure(...)`
-    /// (the install report is sent once, on first launch), or pass it via
-    /// `configure(firebaseAppInstanceId:)`.
-    public static func setFirebaseAppInstanceId(_ appInstanceId: String) {
+    /// Firebase — the host app passes the id in. Prefer setting it on
+    /// `TrackHubConfig` before `start`; later updates re-report install context.
+    public static func updateFirebaseAppInstanceId(_ appInstanceId: String) {
+        guard !isPrivacyStopRequested() else { return }
         guard !appInstanceId.isEmpty else { return }
         UserDefaults.standard.set(appInstanceId, forKey: appInstanceIdKey)
     }
 
     /// Provide the opaque `aggregateConversionInfo` produced by Google's
     /// standalone GoogleAdsOnDeviceConversion SDK on iOS. This is NOT Firebase.
-    /// Call before `configure(...)` (or pass it through
+    /// Call before `start(...)` (or pass it through
     /// `googleOnDeviceMeasurementInfo`) so the first_open request can carry
     /// `odm_info`; TrackHub caches it for later sessions and purchases.
-    public static func setGoogleOnDeviceMeasurementInfo(_ info: String) {
+    public static func updateGoogleOnDeviceMeasurementInfo(_ info: String) {
+        guard !isPrivacyStopRequested() else { return }
         guard let value = boundedOdmInfo(info) else { return }
         UserDefaults.standard.set(value, forKey: odmInfoKey)
     }
@@ -569,48 +561,60 @@ public enum TrackHub {
     /// derive this from the device language/Locale: a user can travel or choose
     /// a language unrelated to their current country. A trusted server edge may
     /// override this value from its geo header.
-    public static func setCountryCode(_ countryCode: String) {
+    public static func updateCountryCode(_ countryCode: String) {
+        guard !isPrivacyStopRequested() else { return }
         guard let value = normalizedCountryCode(countryCode) else { return }
         UserDefaults.standard.set(value, forKey: countryCodeKey)
     }
 
     /// Stable first-launch timestamp for Google's standalone on-device
-    /// measurement SDK. Safe to read before `configure(...)`.
+    /// measurement SDK. Safe to read before `start(...)`.
     public static var firstOpenAt: Date { resolveFirstOpenAt() }
 
-    /// Consent Mode signals used by App Conversion. Call before configure and
-    /// whenever consent changes. A post-configure change re-reports only the
+    /// Consent Mode signals used by App Conversion. Set them before start and
+    /// update whenever consent changes. A post-start change re-reports only the
     /// install identity + latest consent; attribution stays first-write-wins.
-    public static func setGoogleAdsConsent(
-        adUserData: Bool,
-        adPersonalization: Bool,
-        eea: Bool
-    ) {
-        UserDefaults.standard.set(adUserData, forKey: adUserDataKey)
-        UserDefaults.standard.set(adPersonalization, forKey: adPersonalizationKey)
-        UserDefaults.standard.set(eea, forKey: eeaKey)
+    public static func updateGoogleAdsConsent(_ consent: TrackHubGoogleAdsConsent) {
+        guard !isPrivacyStopRequested() else { return }
+        persistGoogleAdsConsent(consent)
         queue.async { reportConsentUpdateIfInstalled() }
     }
 
     /// Mainland-China PIPL signals. Call after your consent UI resolves them.
     /// TrackHub fails closed for Google cross-border ads measurement once these
     /// signals are in use and transfer/measurement consent is not granted.
-    public static func setPIPLConsent(
-        piplConsent: Bool,
-        crossBorderTransferConsent: Bool,
-        adsMeasurementConsent: Bool
-    ) {
-        UserDefaults.standard.set(piplConsent, forKey: piplConsentKey)
-        UserDefaults.standard.set(crossBorderTransferConsent, forKey: crossBorderTransferConsentKey)
-        UserDefaults.standard.set(adsMeasurementConsent, forKey: adsMeasurementConsentKey)
+    public static func updatePIPLConsent(_ consent: TrackHubPIPLConsent) {
+        guard !isPrivacyStopRequested() else { return }
+        persistPIPLConsent(consent)
         queue.async { reportConsentUpdateIfInstalled() }
+    }
+
+    private static func persistGoogleAdsConsent(_ consent: TrackHubGoogleAdsConsent) {
+        let defaults = UserDefaults.standard
+        if let value = consent.adUserData.boolValue { defaults.set(value, forKey: adUserDataKey) }
+        else { defaults.removeObject(forKey: adUserDataKey) }
+        if let value = consent.adPersonalization.boolValue { defaults.set(value, forKey: adPersonalizationKey) }
+        else { defaults.removeObject(forKey: adPersonalizationKey) }
+        if let value = consent.isEea { defaults.set(value, forKey: eeaKey) }
+        else { defaults.removeObject(forKey: eeaKey) }
+    }
+
+    private static func persistPIPLConsent(_ consent: TrackHubPIPLConsent) {
+        let defaults = UserDefaults.standard
+        if let value = consent.personalInformation.boolValue { defaults.set(value, forKey: piplConsentKey) }
+        else { defaults.removeObject(forKey: piplConsentKey) }
+        if let value = consent.crossBorderTransfer.boolValue { defaults.set(value, forKey: crossBorderTransferConsentKey) }
+        else { defaults.removeObject(forKey: crossBorderTransferConsentKey) }
+        if let value = consent.adsMeasurement.boolValue { defaults.set(value, forKey: adsMeasurementConsentKey) }
+        else { defaults.removeObject(forKey: adsMeasurementConsentKey) }
     }
 
     /// Record Google click identifiers captured from an app/universal link.
     /// `gclid` and `gbraid` are attached to the corresponding session_start;
     /// install-time values also ride the one-shot install report. `wbraid` is
     /// retained for the separate web/offline conversion contour.
-    public static func setGoogleClickId(gclid: String? = nil, gbraid: String? = nil, wbraid: String? = nil) {
+    public static func setGoogleClickIds(gclid: String? = nil, gbraid: String? = nil, wbraid: String? = nil) {
+        guard !isPrivacyStopRequested() else { return }
         storeGoogleClickIds(gclid: gclid, gbraid: gbraid, wbraid: wbraid)
         if gclid?.isEmpty == false || gbraid?.isEmpty == false {
             queue.async {
@@ -633,6 +637,7 @@ public enum TrackHub {
     /// Google `gclid`/`gbraid`/`wbraid` and OpenAI Ads `oppref`.
     @discardableResult
     public static func handleDeepLink(_ url: URL) -> Bool {
+        guard !isPrivacyStopRequested() else { return false }
         let ids = parseGoogleClickIds(from: url)
         let oppref = parseOpenAiOppref(from: url)
         guard ids.gclid != nil || ids.gbraid != nil || ids.wbraid != nil || oppref != nil else {
@@ -670,6 +675,7 @@ public enum TrackHub {
     /// convenience for `.reengagement` updates.
     @discardableResult
     public static func handleAdAttributionReengagement(_ url: URL) -> String? {
+        guard !isPrivacyStopRequested() else { return nil }
         guard let tag = parseAdAttributionReengagementConversionTag(from: url) else { return nil }
         UserDefaults.standard.set(tag, forKey: adAttributionConversionTagKey)
         queue.async {
@@ -720,8 +726,10 @@ public enum TrackHub {
         adAttributionTarget: AdAttributionConversionTarget = .all,
         conversionTag: String? = nil
     ) {
+        guard !isPrivacyStopRequested() else { return }
         queue.async {
-            guard let config else { return log("trackEvent(\(name)) before configure — skipped") }
+            refreshApphudIdentity()
+            guard let config else { return log("trackEvent(\(name)) before start — skipped") }
             var body: [String: Any] = [
                 "client_event_id": UUID().uuidString,
                 "event_name": name,
@@ -730,6 +738,7 @@ public enum TrackHub {
                 "occurred_at": iso8601.string(from: Date()),
                 "first_open_at": iso8601.string(from: resolveFirstOpenAt()),
                 "sdk_version": Self.sdkVersion,
+                "sdk_source": "trackhub-ios",
             ]
             appendAppConversionUserAgentContext(to: &body)
             if let country = currentCountryCode() { body["country"] = country }
@@ -838,9 +847,10 @@ public enum TrackHub {
     /// store transaction id Apphud sends. Requires `sdkSecret` because the
     /// server rejects unsigned purchase contexts.
     public static func trackPurchaseObserved(transactionId: String, productId: String? = nil) {
-        guard !transactionId.isEmpty else { return }
+        guard !transactionId.isEmpty, !isPrivacyStopRequested() else { return }
         queue.async {
-            guard let config else { return log("trackPurchaseObserved before configure — skipped") }
+            refreshApphudIdentity()
+            guard let config else { return log("trackPurchaseObserved before start — skipped") }
             guard config.sdkSecret?.isEmpty == false else {
                 return log("trackPurchaseObserved requires sdkSecret — skipped")
             }
@@ -877,9 +887,11 @@ public enum TrackHub {
         var body: [String: Any] = [
             "transaction_id": transactionId,
             "user_id": userId,
+            "install_uid": resolveInstallUid(),
             "occurred_at": iso8601.string(from: occurredAt),
             "first_open_at": iso8601.string(from: firstOpenAt ?? resolveFirstOpenAt()),
             "sdk_version": Self.sdkVersion,
+            "sdk_source": "trackhub-ios",
         ]
         appendAppConversionUserAgentContext(to: &body)
         if let productId, !productId.isEmpty { body["product_id"] = productId }
@@ -896,7 +908,7 @@ public enum TrackHub {
     /// `event` (no analytics — use `trackEvent` for that). On iOS 18+, target
     /// install or re-engagement postbacks independently; on iOS 18.4+, pass a
     /// conversion tag to update one overlapping re-engagement window.
-    public static func track(
+    private static func track(
         _ event: String,
         revenueCents: Int? = nil,
         adAttributionTarget: AdAttributionConversionTarget = .all,
@@ -932,14 +944,9 @@ public enum TrackHub {
         }
     }
 
-    /// Forces a schema refresh (normally automatic on configure).
-    public static func refreshConversionSchema() {
-        queue.async { refreshSchema() }
-    }
-
     // MARK: - Sessions
 
-    private static func startSessionTracking() {
+    private static func startSessionTracking(beginForeground: Bool = true) {
         #if os(iOS)
         if lifecycleObserver == nil {
             lifecycleObserver = LifecycleObserver(
@@ -947,12 +954,17 @@ public enum TrackHub {
                 onBackground: { queue.async { handleBackground() } }
             )
         }
-        handleForeground() // the launch foreground
+        if beginForeground { handleForeground() } // the launch foreground
         #endif
     }
 
     // On `queue`. Reports a new session if this foreground started one.
     private static func handleForeground(force: Bool = false) {
+        refreshApphudIdentity()
+        if trackingDisabled || isPrivacyStopRequested() {
+            retryPendingErasure()
+            return
+        }
         guard let config, let tracker = sessionTracker else { return }
         let started: SessionStart?
         if force {
@@ -969,6 +981,7 @@ public enum TrackHub {
             "started_at": iso8601.string(from: started.startedAt),
             "first_open_at": iso8601.string(from: resolveFirstOpenAt()),
             "sdk_version": Self.sdkVersion,
+            "sdk_source": "trackhub-ios",
         ]
         appendAppConversionUserAgentContext(to: &body)
         if let country = currentCountryCode() { body["country"] = country }
@@ -1001,14 +1014,29 @@ public enum TrackHub {
     private static func reportInstallIfNeeded() {
         guard let config else { return }
         let isIntegrationTest = config.integrationTestToken != nil
-        guard isIntegrationTest || !UserDefaults.standard.bool(forKey: installSentKey) else { return }
+        let defaults = UserDefaults.standard
+        let installUid = resolveInstallUid()
+        let installAlreadySent = defaults.bool(forKey: installSentKey)
+        let hasCredential = InstallCredentialStore.load(
+            ingestToken: config.ingestToken,
+            installUid: installUid
+        ) != nil
+        let bootstrapKey = installCredentialBootstrapKey(token: config.ingestToken)
+        if !isIntegrationTest && !shouldReportInstallForCredential(
+            installAlreadySent: installAlreadySent,
+            hasCredential: hasCredential,
+            lastAttempt: defaults.double(forKey: bootstrapKey),
+            now: Date().timeIntervalSince1970
+        ) {
+            return
+        }
         guard !attConsentDelayActive else {
             return log("install held until ATT resolves or the first-session timeout expires")
         }
         // sdk_* go inside the signed body so the HMAC authenticates the integration marker too.
         var body: [String: Any] = [
             "user_id": config.userId,
-            "install_uid": resolveInstallUid(),
+            "install_uid": installUid,
             "sdk_name": "trackhub-ios",
             "sdk_version": Self.sdkVersion,
         ]
@@ -1019,12 +1047,8 @@ public enum TrackHub {
         appendAppConversionUserAgentContext(to: &body)
         if let country = currentCountryCode() { body["country"] = country }
         body["occurred_at"] = iso8601.string(from: resolveFirstOpenAt())
-        if config.legacyAsaAttributionEnabled,
-           let token = SKANUpdater.attributionToken() {
-            body["adservices_token"] = token
-        }
         // Google click ids captured from a deep link (set via setGoogleClickId /
-        // handleDeepLink before configure) — the iOS path for user-level Google
+        // handleDeepLink before start) — the iOS path for user-level Google
         // attribution + conversion return.
         if let c = UserDefaults.standard.string(forKey: gclidKey) { body["gclid"] = c }
         if let g = UserDefaults.standard.string(forKey: gbraidKey) { body["gbraid"] = g }
@@ -1037,12 +1061,15 @@ public enum TrackHub {
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
         appendConsent(to: &body)
-        send(
+        let accepted = send(
             path: "install",
             body: body,
             kind: isIntegrationTest ? "test_install" : "production_install",
             dedupeKey: "install"
         )
+        if accepted && !isIntegrationTest {
+            defaults.set(Date().timeIntervalSince1970, forKey: bootstrapKey)
+        }
     }
 
     private static func reportPushTokenIfAvailable() {
@@ -1094,6 +1121,7 @@ public enum TrackHub {
         guard let config else { return }
         var body: [String: Any] = [
             "user_id": config.userId,
+            "install_uid": resolveInstallUid(),
             "sdk_name": "trackhub-ios",
             "sdk_version": Self.sdkVersion,
             "platform": "ios",
@@ -1355,9 +1383,15 @@ public enum TrackHub {
             finishAttributionCompletions(nil)
             return
         }
-        guard let provider = config.backendAttributionProvider else {
+        let installUid = resolveInstallUid()
+        let installToken = InstallCredentialStore.load(
+            ingestToken: config.ingestToken,
+            installUid: installUid
+        )
+        if installToken == nil {
             finishAttributionCompletions(nil)
-            return log("attribution fetch requires backendAttributionProvider")
+            reportInstallIfNeeded()
+            return log("attribution waiting for install credential")
         }
         apphudAttributionFetchInFlight = true
         attributionFetchGeneration &+= 1
@@ -1367,59 +1401,74 @@ public enum TrackHub {
                   attributionFetchGeneration == generation else { return }
             apphudAttributionFetchInFlight = false
             finishAttributionCompletions(nil)
-            log("backend attribution fetch timed out — will retry")
+            log("attribution fetch timed out — will retry")
         }
-        DispatchQueue.main.async {
-            provider(config.userId) { responseData in
-                queue.async {
-                    guard apphudAttributionFetchInFlight,
-                          attributionFetchGeneration == generation else { return }
-                    apphudAttributionFetchInFlight = false
-                    guard let responseData,
-                          let envelope = try? JSONDecoder().decode(ApphudAttributionEnvelope.self, from: responseData),
-                          envelope.ok else {
-                        finishAttributionCompletions(nil)
-                        log("backend attribution fetch failed — will retry")
-                        return
-                    }
-                    guard let snapshot = envelope.attribution else {
-                        finishAttributionCompletions(nil)
-                        return
-                    }
-                    guard snapshot.provider == "custom" else {
-                        finishAttributionCompletions(nil)
-                        log("backend returned an invalid attribution provider")
-                        return
-                    }
-                    let resolved = attribution(from: snapshot)
-                    let changed = currentAttributionSnapshot?.revision != resolved.revision
-                    currentAttributionSnapshot = resolved
-                    finishAttributionCompletions(resolved)
-                    if changed, let handler = config.attributionChangedHandler {
-                        DispatchQueue.main.async { handler(resolved) }
-                    }
-                    guard let handler = config.apphudAttributionHandler,
-                          shouldDeliverApphudAttribution(
-                            revision: snapshot.revision,
-                            userId: config.userId
-                          ) else { return }
-                    DispatchQueue.main.async {
-                        handler(snapshot.data) { accepted in
-                            queue.async {
-                                if accepted {
-                                    markApphudAttributionDelivered(
-                                        revision: snapshot.revision,
-                                        userId: config.userId
-                                    )
-                                    log("Apphud attribution revision \(snapshot.revision) delivered")
-                                } else {
-                                    log("Apphud rejected attribution — will retry")
-                                }
+        let consume: (Data?) -> Void = { responseData in
+            queue.async {
+                guard apphudAttributionFetchInFlight,
+                      attributionFetchGeneration == generation else { return }
+                apphudAttributionFetchInFlight = false
+                guard let responseData,
+                      let envelope = try? JSONDecoder().decode(ApphudAttributionEnvelope.self, from: responseData),
+                      envelope.ok else {
+                    finishAttributionCompletions(nil)
+                    log("attribution fetch failed — will retry")
+                    return
+                }
+                guard let snapshot = envelope.attribution else {
+                    finishAttributionCompletions(nil)
+                    return
+                }
+                guard snapshot.provider == "custom" else {
+                    finishAttributionCompletions(nil)
+                    log("server returned an invalid attribution provider")
+                    return
+                }
+                let resolved = attribution(from: snapshot)
+                let changed = currentAttributionSnapshot?.revision != resolved.revision
+                currentAttributionSnapshot = resolved
+                finishAttributionCompletions(resolved)
+                if changed, let handler = config.attributionChangedHandler {
+                    DispatchQueue.main.async { handler(resolved) }
+                }
+                guard shouldDeliverApphudAttribution(
+                        revision: snapshot.revision,
+                        userId: config.userId
+                      ) else { return }
+                DispatchQueue.main.async {
+                    Apphud.setAttribution(
+                        data: ApphudAttributionData(rawData: snapshot.data),
+                        from: .custom,
+                        identifer: nil
+                    ) { accepted, _ in
+                        queue.async {
+                            if accepted {
+                                markApphudAttributionDelivered(
+                                    revision: snapshot.revision,
+                                    userId: config.userId
+                                )
+                                log("Apphud attribution revision \(snapshot.revision) delivered")
+                            } else {
+                                log("Apphud rejected attribution — will retry")
                             }
                         }
                     }
                 }
             }
+        }
+        guard let installToken, let networkConfig = currentNetworkConfig(),
+              let bodyData = try? JSONSerialization.data(withJSONObject: ["install_uid": installUid]) else {
+            apphudAttributionFetchInFlight = false
+            finishAttributionCompletions(nil)
+            return
+        }
+        postRaw(
+            config: networkConfig,
+            path: "sdk/attribution",
+            bodyData: bodyData,
+            installToken: installToken
+        ) { status, responseData in
+            consume(status.map(isSuccess) == true ? responseData : nil)
         }
     }
 
@@ -1427,6 +1476,236 @@ public enum TrackHub {
         let digest = SHA256.hash(data: Data(token.utf8))
         let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
         return privacyDisabledKeyPrefix + suffix
+    }
+
+    private struct PendingPrivacyErasure: Codable {
+        let installUid: String
+        let reason: String
+        var attempts: Int
+        var nextAttemptAt: TimeInterval
+    }
+
+    private static func privacyPendingKey(token: String) -> String {
+        let digest = SHA256.hash(data: Data(token.utf8))
+        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return privacyPendingKeyPrefix + suffix
+    }
+
+    private static func isPrivacyStopRequested() -> Bool {
+        privacyStateLock.lock()
+        defer { privacyStateLock.unlock() }
+        return privacyStopRequested
+    }
+
+    private static func pendingErasureFileURL(token: String) -> URL {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let directory = root.appendingPathComponent("TrackHub", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let digest = SHA256.hash(data: Data(token.utf8))
+        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("trackhub_privacy_\(suffix).json")
+    }
+
+    private static func hasPendingErasureState(token: String) -> Bool {
+        FileManager.default.fileExists(atPath: pendingErasureFileURL(token: token).path)
+            || UserDefaults.standard.object(forKey: privacyPendingKey(token: token)) != nil
+    }
+
+    @discardableResult
+    private static func persistPendingErasure(installUid: String, reason: String, token: String) -> Bool {
+        let pending = PendingPrivacyErasure(
+            installUid: installUid,
+            reason: reason,
+            attempts: 0,
+            nextAttemptAt: 0
+        )
+        return persistPendingErasure(pending, token: token)
+    }
+
+    @discardableResult
+    private static func persistPendingErasure(_ pending: PendingPrivacyErasure, token: String) -> Bool {
+        guard let data = try? JSONEncoder().encode(pending), data.count <= 1_024 else { return false }
+        do {
+            try data.write(to: pendingErasureFileURL(token: token), options: .atomic)
+            UserDefaults.standard.removeObject(forKey: privacyPendingKey(token: token))
+            return true
+        } catch {
+            // Application Support can be temporarily unavailable before first
+            // unlock. Keep a second durable copy so a killed process still
+            // resumes erasure; the next successful file write removes it.
+            UserDefaults.standard.set(data, forKey: privacyPendingKey(token: token))
+            let stored = UserDefaults.standard.synchronize()
+            if !stored { log("privacy erasure task could not be persisted") }
+            return stored
+        }
+    }
+
+    private static func loadPendingErasure(token: String) -> PendingPrivacyErasure? {
+        let file = pendingErasureFileURL(token: token)
+        if let data = try? Data(contentsOf: file), data.count <= 1_024,
+           let pending = try? JSONDecoder().decode(PendingPrivacyErasure.self, from: data) {
+            return pending
+        }
+        // One-time migration from the 1.12 prerelease implementation.
+        guard let legacy = UserDefaults.standard.data(forKey: privacyPendingKey(token: token)),
+              let pending = try? JSONDecoder().decode(PendingPrivacyErasure.self, from: legacy)
+        else { return nil }
+        _ = persistPendingErasure(
+            installUid: pending.installUid,
+            reason: pending.reason,
+            token: token
+        )
+        return pending
+    }
+
+    private static func stopAndClearLocalMeasurement(retainingInstallUid: String?) {
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        retryDeadline = nil
+        transientRetryNotBefore = nil
+        deliveryCompletions.removeAll()
+        currentAttributionSnapshot = nil
+        apphudAttributionFetchInFlight = false
+        sessionTracker = nil
+        if eventQueue?.removeAll() == false {
+            log("privacy erasure could not clear the offline queue")
+        }
+        for key in [
+            pushTokenKey, pushEnvironmentKey, deviceIdKey,
+            gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
+            openAiOpprefKey, pendingOpenAiOpprefKey, appInstanceIdKey, odmInfoKey,
+            adUserDataKey, adPersonalizationKey, eeaKey,
+            piplConsentKey, crossBorderTransferConsentKey, adsMeasurementConsentKey,
+        ] {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        UserDefaults.standard.dictionaryRepresentation().keys
+            .filter {
+                $0.hasPrefix(apphudAttributionRevisionKeyPrefix)
+                    || $0.hasPrefix(apphudUserIdKeyPrefix)
+            }
+            .forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        if let retainingInstallUid {
+            UserDefaults.standard.set(retainingInstallUid, forKey: installUidKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: installUidKey)
+        }
+    }
+
+    private static func completePendingErasure(
+        _ pending: PendingPrivacyErasure,
+        token: String,
+        completion: ((Bool) -> Void)?
+    ) {
+        UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: token))
+        UserDefaults.standard.synchronize()
+        InstallCredentialStore.delete(ingestToken: token, installUid: pending.installUid)
+        // The credential and install id are erased last: both are required to
+        // authorize/recover an offline privacy job.
+        UserDefaults.standard.removeObject(forKey: installUidKey)
+        try? FileManager.default.removeItem(at: pendingErasureFileURL(token: token))
+        UserDefaults.standard.removeObject(forKey: privacyPendingKey(token: token))
+        privacyErasureInFlight = false
+        privacyRetryWorkItem?.cancel()
+        privacyRetryWorkItem = nil
+        let callback = completion ?? privacyErasureCompletion
+        privacyErasureCompletion = nil
+        DispatchQueue.main.async { callback?(true) }
+    }
+
+    private static func schedulePendingErasureRetry(
+        _ pending: PendingPrivacyErasure,
+        token: String,
+        completion: ((Bool) -> Void)?
+    ) {
+        var updated = pending
+        updated.attempts = min(pending.attempts + 1, 30)
+        let delay = retryDelay(attempt: updated.attempts, jitter: Double.random(in: 0...1))
+        updated.nextAttemptAt = Date().timeIntervalSince1970 + delay
+        _ = persistPendingErasure(updated, token: token)
+        privacyErasureInFlight = false
+        privacyRetryWorkItem?.cancel()
+        let item = DispatchWorkItem { retryPendingErasure() }
+        privacyRetryWorkItem = item
+        queue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private static func retryPendingErasure(completion: ((Bool) -> Void)? = nil) {
+        if let completion { privacyErasureCompletion = completion }
+        guard !privacyErasureInFlight,
+              let config,
+              let networkConfig = currentNetworkConfig(),
+              let pending = loadPendingErasure(token: config.ingestToken) else {
+            if loadPendingErasure(token: config?.ingestToken ?? "") == nil {
+                let callback = completion ?? privacyErasureCompletion
+                privacyErasureCompletion = nil
+                DispatchQueue.main.async { callback?(false) }
+            }
+            return
+        }
+        let now = Date().timeIntervalSince1970
+        guard pending.nextAttemptAt <= now else {
+            privacyRetryWorkItem?.cancel()
+            let item = DispatchWorkItem { retryPendingErasure() }
+            privacyRetryWorkItem = item
+            queue.asyncAfter(deadline: .now() + pending.nextAttemptAt - now, execute: item)
+            return
+        }
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: [
+            "install_uid": pending.installUid,
+            "reason": pending.reason,
+        ]) else {
+            schedulePendingErasureRetry(pending, token: config.ingestToken, completion: completion)
+            return
+        }
+        privacyErasureInFlight = true
+
+        func recover(_ clockRetried: Bool) {
+            postRaw(
+                config: networkConfig,
+                path: "sdk/forget-device/recover",
+                bodyData: bodyData
+            ) { status, responseData in
+                queue.async {
+                    if status.map(isSuccess) == true || status == 410 {
+                        completePendingErasure(pending, token: config.ingestToken, completion: completion)
+                    } else if status == 401, !clockRetried, applyServerClock(responseData) {
+                        recover(true)
+                    } else {
+                        schedulePendingErasureRetry(pending, token: config.ingestToken, completion: completion)
+                    }
+                }
+            }
+        }
+
+        guard let installToken = InstallCredentialStore.load(
+            ingestToken: config.ingestToken,
+            installUid: pending.installUid
+        ) else {
+            recover(false)
+            return
+        }
+        postRaw(
+            config: networkConfig,
+            path: "sdk/forget-device",
+            bodyData: bodyData,
+            installToken: installToken
+        ) { status, responseData in
+            queue.async {
+                if status.map(isSuccess) == true || status == 410 {
+                    completePendingErasure(pending, token: config.ingestToken, completion: completion)
+                } else if status == 401 {
+                    if applyServerClock(responseData) {
+                        recover(true)
+                    } else {
+                        recover(false)
+                    }
+                } else {
+                    schedulePendingErasureRetry(pending, token: config.ingestToken, completion: completion)
+                }
+            }
+        }
     }
 
     private static func resolveDeferredDeepLinkIfNeeded(
@@ -1489,7 +1768,7 @@ public enum TrackHub {
         dedupeKey: String? = nil,
         completion: ((Int?) -> Void)? = nil
     ) -> Bool {
-        guard !trackingDisabled else { return false }
+        guard !trackingDisabled, !isPrivacyStopRequested() else { return false }
         var payload = body
         if let testToken = config?.integrationTestToken { payload["test_run_token"] = testToken }
         guard JSONSerialization.isValidJSONObject(payload),
@@ -1620,6 +1899,7 @@ public enum TrackHub {
             switch report.kind {
             case "production_install":
                 UserDefaults.standard.set(true, forKey: installSentKey)
+                saveInstallCredential(from: responseData)
                 log("install reported")
                 reportConsentUpdate()
                 fetchAttributionIfNeeded()
@@ -1764,11 +2044,59 @@ public enum TrackHub {
 
     private static func publishApphudDeviceIdentifiers() {
         #if os(iOS)
-        guard let handler = config?.apphudDeviceIdentifiersHandler else { return }
         let idfa = currentAuthorizedIDFA()
         let idfv = identifierForVendorSnapshot
-        DispatchQueue.main.async { handler(idfa, idfv) }
+        DispatchQueue.main.async { Apphud.setDeviceIdentifiers(idfa: idfa, idfv: idfv) }
         #endif
+    }
+
+    private static func refreshApphudIdentity() {
+        guard !trackingDisabled, !isPrivacyStopRequested(), config != nil else { return }
+        DispatchQueue.main.async {
+            let resolved = Apphud.userID().trimmingCharacters(in: .whitespacesAndNewlines)
+            queue.async {
+                guard !resolved.isEmpty, var current = config, resolved != current.userId else { return }
+                current.userId = resolved
+                config = current
+                currentAttributionSnapshot = nil
+                syncApphudIdentityIfNeeded(resolved)
+                reportPushTokenIfAvailable()
+                fetchAttributionIfNeeded()
+                syncServerConversionValue()
+            }
+        }
+    }
+
+    private static func apphudUserIdKey(token: String) -> String {
+        let digest = SHA256.hash(data: Data(token.utf8))
+        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+        return apphudUserIdKeyPrefix + suffix
+    }
+
+    // Persist the acknowledgement, not merely the enqueue. If the queue is
+    // evicted or the process dies before delivery, the next start re-enqueues
+    // the idempotent binding instead of silently losing an Apphud ID change.
+    private static func syncApphudIdentityIfNeeded(_ resolved: String) {
+        guard let config, !resolved.isEmpty else { return }
+        let persistedKey = apphudUserIdKey(token: config.ingestToken)
+        guard UserDefaults.standard.string(forKey: persistedKey) != resolved else { return }
+        let identityDigest = SHA256.hash(data: Data(resolved.utf8))
+            .prefix(12).map { String(format: "%02x", $0) }.joined()
+        let body: [String: Any] = [
+            "user_id": resolved,
+            "install_uid": resolveInstallUid(),
+            "sdk_source": "trackhub-ios",
+            "sdk_version": Self.sdkVersion,
+        ]
+        _ = send(
+            path: "sdk/identity",
+            body: body,
+            kind: "apphud_identity",
+            dedupeKey: "apphud_identity:\(identityDigest)"
+        ) { status in
+            guard status.map(isSuccess) == true else { return }
+            UserDefaults.standard.set(resolved, forKey: persistedKey)
+        }
     }
 
     #if os(iOS) && canImport(AppTrackingTransparency)
@@ -1844,6 +2172,7 @@ public enum TrackHub {
         config: NetworkConfig,
         path: String,
         bodyData: Data,
+        installToken: String? = nil,
         completion: @escaping (Int?, Data?) -> Void
     ) {
         let url = config.endpoint.appendingPathComponent("ingest").appendingPathComponent(config.ingestToken).appendingPathComponent(path)
@@ -1851,6 +2180,9 @@ public enum TrackHub {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("TrackHub-iOS/\(Self.sdkVersion)", forHTTPHeaderField: "User-Agent")
+        if let installToken {
+            request.setValue(installToken, forHTTPHeaderField: "X-TrackHub-Install-Token")
+        }
         request.httpBody = bodyData
         if let secret = config.sdkSecret, !secret.isEmpty {
             let localTime = Int64(Date().timeIntervalSince1970 * 1_000)
@@ -1863,6 +2195,41 @@ public enum TrackHub {
             request.setValue(mac.map { String(format: "%02x", $0) }.joined(), forHTTPHeaderField: "X-TrackHub-Signature")
         }
         httpClient.data(for: request, completion: completion)
+    }
+
+    private static func installCredentialBootstrapKey(token: String) -> String {
+        let digest = SHA256.hash(data: Data(token.utf8))
+        return installCredentialBootstrapKeyPrefix
+            + digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    @_spi(Testing) public static func shouldReportInstallForCredential(
+        installAlreadySent: Bool,
+        hasCredential: Bool,
+        lastAttempt: TimeInterval,
+        now: TimeInterval,
+        interval: TimeInterval = 24 * 60 * 60
+    ) -> Bool {
+        if !installAlreadySent { return true }
+        if hasCredential { return false }
+        return lastAttempt <= 0 || now - lastAttempt >= interval
+    }
+
+    private static func saveInstallCredential(from responseData: Data?) {
+        guard let config, let responseData,
+              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let token = json["install_token"] as? String,
+              let installUid = json["install_uid"] as? String,
+              installUid == resolveInstallUid(),
+              InstallCredentialStore.save(
+                token,
+                ingestToken: config.ingestToken,
+                installUid: installUid
+              ) else { return }
+        UserDefaults.standard.removeObject(
+            forKey: installCredentialBootstrapKey(token: config.ingestToken)
+        )
+        log("device-scoped install credential received")
     }
 
     static func log(_ message: String) {

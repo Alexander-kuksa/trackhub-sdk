@@ -1,7 +1,6 @@
 import Foundation
 #if os(iOS)
 import StoreKit
-import AdServices
 #endif
 #if os(iOS) && canImport(AdAttributionKit)
 import AdAttributionKit
@@ -150,15 +149,4 @@ enum SKANUpdater {
         conversionTag: String?
     ) {}
     #endif
-
-    /// AdServices attribution token — resolved server-side by the platform.
-    /// Returns nil on simulators and macOS.
-    static func attributionToken() -> String? {
-        #if os(iOS)
-        if #available(iOS 14.3, *) {
-            return try? AAAttribution.attributionToken()
-        }
-        #endif
-        return nil
-    }
 }
