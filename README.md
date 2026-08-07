@@ -1,6 +1,6 @@
 # TrackHub iOS SDK
 
-> **Текущая версия:** `1.10.2` · **минимальная iOS:** 14 · **проверено:** 7 августа 2026 г.
+> **Текущая версия:** `1.11.0` · **минимальная iOS:** 14 · **проверено:** 7 августа 2026 г.
 > Полная документация платформы: [TrackHub docs](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/README.md).
 > Пошаговое подключение: [`INTEGRATION.md`](INTEGRATION.md).
 > Общий iOS/Android rollout: [SDK Integration Guide](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_INTEGRATION_GUIDE.md).
@@ -14,18 +14,18 @@ remote-controlled SKAdNetwork and AdAttributionKit conversion values
 
 > **Build status.** GitHub Actions (`.github/workflows/ios-ci.yml`) builds the Swift package,
 > runs the executable contract suite and compiles the library for a generic iOS Simulator on
-> every push and pull request. The source below requires the `1.10.2` release tag to be published
+> every push and pull request. The source below requires the `1.11.0` release tag to be published
 > before consumer apps can resolve that version.
 
 ## Install
 
 Xcode → File → Add Package Dependencies → `https://github.com/Alexander-kuksa/trackhub-sdk` →
-Dependency Rule: Up to Next Major `1.10.2`. iOS 14+, no third-party dependencies.
+Dependency Rule: Up to Next Major `1.11.0`. iOS 14+, no third-party dependencies.
 
 Swift Package Manager (`Package.swift`):
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.2")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.11.0")
 ```
 
 ## Usage
@@ -96,8 +96,9 @@ TrackHub.trackPurchaseCtaTapped(at: .onboarding) // before StoreKit; trial or pu
 // Other custom engagement events:
 TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
 
-// After a successful store purchase, send only the stable transaction identity.
-// Apphud remains the source of truth for revenue/value/currency.
+// Only when Google App Conversion purchase events are enabled, send the stable
+// transaction identity after purchase. Apphud remains the source of truth for
+// revenue/value/currency; this call is not needed for Apple conversion values.
 TrackHub.trackPurchaseObserved(
     transactionId: String(transaction.id),
     productId: transaction.productID
@@ -121,7 +122,7 @@ been explicitly re-enabled for legacy ASA processing.
 
 ### AdAttributionKit
 
-SDK 1.10.2 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
+SDK 1.11.0 updates SKAdNetwork and AdAttributionKit from the same conversion-value schema. Add the
 `AttributionCopyEndpoint` Info.plist key using the origin shown on the app page in TrackHub. To
 receive re-engagement copies, also enable
 `EligibleForAdAttributionKitReengagementPostbackCopies`.
@@ -212,6 +213,13 @@ What happens under the hood:
   repeat launches are no-ops only after TrackHub acknowledges it.
 - **Every launch:** the active conversion value schema is fetched from
   `GET /ingest/{token}/cv-schema` and cached locally.
+- **Signed iOS session/event response:** TrackHub recalculates the greatest applicable conversion
+  rule from confirmed Apphud/S2S/store history under that active schema and returns only
+  fine/coarse/lock bits. The SDK applies them through SKAdNetwork and AdAttributionKit. Event names
+  are exact (`trial_started` is not `trial_converted`); no manual client mirror is required. Because
+  the server cannot wake the app, a confirmed server event is applied on the next SDK request. The
+  greatest fine and per-window coarse values are persisted. Lock is sticky only in the current
+  Apple window, preventing both downgrades and accidental locking of a later postback.
 - **`trackEvent(name, …)`:** persists the event before a single delivery worker sends it to TrackHub
   analytics (`POST /ingest/{token}/sdk/track`) with timeout/backoff, and drives both on-device Apple
   attribution APIs via `track()`.
@@ -228,7 +236,7 @@ What happens under the hood:
 не пробрасываются сетевые исключения. Ограничения намеренно конечны, чтобы сбой сервера не мог
 создать неограниченное потребление памяти, диска или потоков.
 
-| Механизм | Гарантия SDK 1.10.2 |
+| Механизм | Гарантия SDK 1.11.0 |
 |---|---|
 | Запись | Каждый install/session/event сначала атомарно записывается в защищённую файловую очередь, затем отправляется |
 | Очередь | До 1 000 отчётов и 4 MiB суммарно; один отчёт — до 64 KiB |
@@ -262,10 +270,11 @@ HTTP `2xx` и локальным удалением элемента.
 ## Notes
 
 - Revenue/subscription source of truth is Apphud/S2S (webhooks + server notifications), not SDK
-  events. `trackEvent` accepts engagement events only. `trackPurchaseObserved` sends no money: the
-  server temporarily captures the device context required by Google and releases the conversion
-  only after the matching Apphud transaction arrives. `track()` (without "Event") only drives
-  Apple attribution conversion values on the device and sends no analytics.
+  events. `trackEvent` accepts engagement events only. `trackPurchaseObserved` is required only
+  when Google App Conversion purchase events are enabled; it sends no money and temporarily captures
+  the device context that is joined to the matching Apphud transaction. Apphud S2S alone is enough
+  for revenue analytics and server-calculated Apple conversion values. `track()` (without "Event")
+  remains an advanced SKAN-only manual update and sends no analytics.
 - `trackPaywallShown` and `trackPurchaseCtaTapped` always use the stable event names `pw_shown`
   and `purchase_cta_tapped`. The standard placement is sent as the `placement_name` parameter,
   never appended to the event name. TrackHub supports parameters end-to-end.

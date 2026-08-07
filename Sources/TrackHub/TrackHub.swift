@@ -111,7 +111,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "1.10.2"
+    public static let sdkVersion = "1.11.0"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -167,6 +167,9 @@ public enum TrackHub {
     }
 
     private static let schemaCacheKey = "trackhub.cv_schema"
+    private static let highestInstallFineKey = "trackhub.cv_highest_install_fine"
+    private static let highestInstallCoarseKeyPrefix = "trackhub.cv_highest_install_coarse."
+    private static let installWindowLockedKeyPrefix = "trackhub.cv_install_window_locked."
     private static let installSentKey = "trackhub.install_sent"
     private static let firstOpenAtKey = "trackhub.first_open_at"
     private static let deviceIdKey = "trackhub.device_id"
@@ -282,7 +285,10 @@ public enum TrackHub {
             }
             startATTConsentDelayIfNeeded()
             publishApphudDeviceIdentifiers()
-            SKANUpdater.registerForAttribution()
+            if config?.integrationTestToken == nil {
+                SKANUpdater.registerForAttribution()
+                applyLocalInstallConversionRule()
+            }
             reportInstallIfNeeded()
             reportPushTokenIfAvailable()
             fetchAttributionIfNeeded()
@@ -315,6 +321,7 @@ public enum TrackHub {
             config?.userId = userId
             reportPushTokenIfAvailable()
             fetchAttributionIfNeeded()
+            syncServerConversionValue()
         }
     }
 
@@ -719,6 +726,7 @@ public enum TrackHub {
                 "client_event_id": UUID().uuidString,
                 "event_name": name,
                 "user_id": config.userId,
+                "install_uid": resolveInstallUid(),
                 "occurred_at": iso8601.string(from: Date()),
                 "first_open_at": iso8601.string(from: resolveFirstOpenAt()),
                 "sdk_version": Self.sdkVersion,
@@ -895,6 +903,9 @@ public enum TrackHub {
         conversionTag: String? = nil
     ) {
         queue.async {
+            guard config?.integrationTestToken == nil else {
+                return log("Apple conversion update suppressed in Integration Test Lab")
+            }
             guard let schema else { return log("track(\(event)) before schema is available — skipped") }
             guard let update = ConversionEncoder.encode(schema: schema, event: event, revenueCents: revenueCents) else {
                 return log("event \(event) has no rule in schema v\(schema.schemaVersion)")
@@ -905,8 +916,16 @@ public enum TrackHub {
                     ? UserDefaults.standard.string(forKey: adAttributionConversionTagKey)
                     : nil
             )
+            let safeUpdate: ConversionUpdate
+            if adAttributionTarget == .reengagement {
+                safeUpdate = update
+            } else if let window = currentInstallConversionWindow() {
+                safeUpdate = monotonicInstallConversionUpdate(update, window: window)
+            } else {
+                safeUpdate = update
+            }
             SKANUpdater.apply(
-                update,
+                safeUpdate,
                 adAttributionTarget: adAttributionTarget,
                 conversionTag: resolvedTag
             )
@@ -944,6 +963,7 @@ public enum TrackHub {
         guard let started else { return }
         var body: [String: Any] = [
             "user_id": config.userId,
+            "install_uid": resolveInstallUid(),
             "session_uid": started.sessionUid,
             "session_num": started.sessionNum,
             "started_at": iso8601.string(from: started.startedAt),
@@ -1105,8 +1125,156 @@ public enum TrackHub {
                 schema = fetched
                 UserDefaults.standard.set(data, forKey: schemaCacheKey)
                 log("schema v\(fetched.schemaVersion) active (\(fetched.rules.count) rules)")
+                applyLocalInstallConversionRule()
             }
         }
+    }
+
+    // Registration starts at Apple's default value 0. If the active schema
+    // assigns install/first_open a different value, apply that configured value
+    // as soon as cached or freshly fetched schema data is available.
+    private static func applyLocalInstallConversionRule() {
+        guard config?.integrationTestToken == nil else { return }
+        guard let schema, let window = currentInstallConversionWindow() else { return }
+        let updates = ["install", "first_open"].compactMap { event -> ConversionUpdate? in
+            guard let encoded = ConversionEncoder.encode(schema: schema, event: event) else { return nil }
+            // A lock finalizes only the window in which its event occurred.
+            // Install/first_open happened in window 0 and must not lock 1–2.
+            return window == 0 || !encoded.lockWindow
+                ? encoded
+                : ConversionUpdate(fine: encoded.fine, coarse: encoded.coarse, lockWindow: false)
+        }
+        let remembered = rememberedInstallConversionUpdate(window: window)
+        let update = updates.reduce(remembered) { current, incoming in
+            mergeMonotonicConversionUpdates(current: current, incoming: incoming)
+        }
+        guard let update else { return }
+        rememberInstallConversionUpdate(update, window: window)
+        SKANUpdater.apply(
+            update,
+            adAttributionTarget: .install,
+            conversionTag: nil
+        )
+    }
+
+    // A late Apphud identity must be able to receive a server-calculated CV
+    // without inventing an analytics session. Foreground/session and track
+    // responses also carry the same update, matching Adjust's async behavior.
+    private static func syncServerConversionValue() {
+        guard let config,
+              config.integrationTestToken == nil,
+              config.sdkSecret?.isEmpty == false else { return }
+        let body: [String: Any] = [
+            "user_id": config.userId,
+            "install_uid": resolveInstallUid(),
+            "first_open_at": iso8601.string(from: resolveFirstOpenAt()),
+        ]
+        send(
+            path: "sdk/conversion-value",
+            body: body,
+            dedupeKey: "conversion-value-sync"
+        )
+    }
+
+    @_spi(Testing) public static func decodeServerConversionInstruction(
+        _ data: Data?
+    ) -> ServerConversionInstruction? {
+        guard let data,
+              let envelope = try? JSONDecoder().decode(ServerConversionEnvelope.self, from: data),
+              envelope.conversionUpdate?.update != nil else { return nil }
+        return envelope.conversionUpdate
+    }
+
+    private static func applyServerConversionResponse(_ data: Data?) {
+        guard let instruction = decodeServerConversionInstruction(data),
+              let update = instruction.update else { return }
+        guard currentInstallConversionWindow() == instruction.window else {
+            return log("server conversion response belongs to a different Apple window — skipped")
+        }
+        let safeUpdate = monotonicInstallConversionUpdate(update, window: instruction.window)
+        log(
+            "server schema v\(instruction.schemaVersion) → fine \(safeUpdate.fine), "
+            + "coarse \(safeUpdate.coarse ?? "—"), lock \(safeUpdate.lockWindow)"
+        )
+        SKANUpdater.apply(
+            safeUpdate,
+            adAttributionTarget: .install,
+            conversionTag: nil
+        )
+    }
+
+    @_spi(Testing) public static func mergeMonotonicConversionUpdates(
+        current: ConversionUpdate?,
+        incoming: ConversionUpdate
+    ) -> ConversionUpdate {
+        guard let current else { return incoming }
+        let coarseOrder = ["low": 1, "medium": 2, "high": 3]
+        let currentRank = current.coarse.flatMap { coarseOrder[$0] } ?? 0
+        let incomingRank = incoming.coarse.flatMap { coarseOrder[$0] } ?? 0
+        return ConversionUpdate(
+            fine: max(current.fine, incoming.fine),
+            coarse: incomingRank > currentRank ? incoming.coarse : current.coarse,
+            lockWindow: current.lockWindow || incoming.lockWindow
+        )
+    }
+
+    @_spi(Testing) public static func installConversionWindow(
+        firstOpenAt: Date,
+        now: Date
+    ) -> Int? {
+        let age = now.timeIntervalSince(firstOpenAt)
+        guard age >= 0 else { return nil }
+        let day: TimeInterval = 24 * 60 * 60
+        if age < 2 * day { return 0 }
+        if age < 7 * day { return 1 }
+        if age <= 35 * day { return 2 }
+        return nil
+    }
+
+    private static func currentInstallConversionWindow() -> Int? {
+        installConversionWindow(firstOpenAt: resolveFirstOpenAt(), now: Date())
+    }
+
+    private static func highestInstallCoarseKey(window: Int) -> String {
+        highestInstallCoarseKeyPrefix + String(window)
+    }
+
+    private static func installWindowLockedKey(window: Int) -> String {
+        installWindowLockedKeyPrefix + String(window)
+    }
+
+    private static func rememberedInstallConversionUpdate(window: Int) -> ConversionUpdate? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: highestInstallFineKey) != nil else { return nil }
+        return ConversionUpdate(
+            fine: defaults.integer(forKey: highestInstallFineKey),
+            coarse: defaults.string(forKey: highestInstallCoarseKey(window: window)),
+            lockWindow: defaults.bool(forKey: installWindowLockedKey(window: window))
+        )
+    }
+
+    private static func rememberInstallConversionUpdate(_ update: ConversionUpdate, window: Int) {
+        let defaults = UserDefaults.standard
+        defaults.set(update.fine, forKey: highestInstallFineKey)
+        let coarseKey = highestInstallCoarseKey(window: window)
+        if let coarse = update.coarse {
+            defaults.set(coarse, forKey: coarseKey)
+        } else {
+            defaults.removeObject(forKey: coarseKey)
+        }
+        defaults.set(update.lockWindow, forKey: installWindowLockedKey(window: window))
+    }
+
+    private static func monotonicInstallConversionUpdate(
+        _ incoming: ConversionUpdate,
+        window: Int
+    ) -> ConversionUpdate {
+        let merged = mergeMonotonicConversionUpdates(
+            current: rememberedInstallConversionUpdate(window: window),
+            incoming: incoming
+        )
+        rememberInstallConversionUpdate(merged, window: window)
+        return merged
     }
 
     private static func loadCachedSchema() -> ConversionSchema? {
@@ -1444,6 +1612,11 @@ public enum TrackHub {
         }
         let completion = deliveryCompletions.removeValue(forKey: report.id)
         if isSuccess(status) {
+            if report.path == "sdk/session"
+                || report.path == "sdk/track"
+                || report.path == "sdk/conversion-value" {
+                applyServerConversionResponse(responseData)
+            }
             switch report.kind {
             case "production_install":
                 UserDefaults.standard.set(true, forKey: installSentKey)

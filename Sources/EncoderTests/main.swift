@@ -71,6 +71,59 @@ if let decoded = try? JSONDecoder().decode(ConversionSchema.self, from: json) {
     check(false, "server JSON decodes")
 }
 
+let serverResponse = """
+{
+  "ok": true,
+  "conversion_update": {
+    "schema_version": 9,
+    "window": 1,
+    "fine": 17,
+    "coarse": "high",
+    "lock_window": true
+  }
+}
+""".data(using: .utf8)!
+let serverInstruction = TrackHub.decodeServerConversionInstruction(serverResponse)
+check(
+    serverInstruction?.schemaVersion == 9
+        && serverInstruction?.window == 1
+        && serverInstruction?.update == ConversionUpdate(fine: 17, coarse: "high", lockWindow: true),
+    "signed SDK response decodes server-managed conversion bits"
+)
+let invalidServerResponse = """
+{"conversion_update":{"schema_version":9,"window":3,"fine":64,"coarse":"high","lock_window":false}}
+""".data(using: .utf8)!
+check(
+    TrackHub.decodeServerConversionInstruction(invalidServerResponse) == nil,
+    "server-managed conversion bits fail closed outside Apple's 0...63 range"
+)
+let monotonic = TrackHub.mergeMonotonicConversionUpdates(
+    current: ConversionUpdate(fine: 30, coarse: "low", lockWindow: false),
+    incoming: ConversionUpdate(fine: 12, coarse: "high", lockWindow: true)
+)
+check(
+    monotonic == ConversionUpdate(fine: 30, coarse: "high", lockWindow: true),
+    "same-window conversion updates retain greatest fine/coarse values and sticky lock"
+)
+let conversionEpoch = Date(timeIntervalSince1970: 1_700_000_000)
+let conversionDay: TimeInterval = 24 * 60 * 60
+check(
+    TrackHub.installConversionWindow(firstOpenAt: conversionEpoch, now: conversionEpoch.addingTimeInterval(conversionDay)) == 0,
+    "days 0–2 use Apple conversion window 0"
+)
+check(
+    TrackHub.installConversionWindow(firstOpenAt: conversionEpoch, now: conversionEpoch.addingTimeInterval(3 * conversionDay)) == 1,
+    "days 3–7 use Apple conversion window 1"
+)
+check(
+    TrackHub.installConversionWindow(firstOpenAt: conversionEpoch, now: conversionEpoch.addingTimeInterval(8 * conversionDay)) == 2,
+    "days 8–35 use Apple conversion window 2"
+)
+check(
+    TrackHub.installConversionWindow(firstOpenAt: conversionEpoch, now: conversionEpoch.addingTimeInterval(36 * conversionDay)) == nil,
+    "server-managed install conversion updates stop after day 35"
+)
+
 // SDK Signature HMAC parity with the server (tests/sdk-signature.test.ts):
 // HMAC-SHA256("parity" key, v2 endpoint-bound message) must match Node/Android.
 let sigMsg = "123.tok.install.{\"a\":1}"

@@ -65,6 +65,36 @@ import Foundation
     }
 }
 
+/// Exact fine/coarse/lock bits calculated from authenticated server activity.
+/// Event names and revenue never need to cross back into the app.
+@_spi(Testing) public struct ServerConversionInstruction: Codable, Equatable {
+    public let schemaVersion: Int
+    public let window: Int
+    public let fine: Int
+    public let coarse: String?
+    public let lockWindow: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case window, fine, coarse
+        case lockWindow = "lock_window"
+    }
+
+    public var update: ConversionUpdate? {
+        guard (0...2).contains(window), (0...63).contains(fine), schemaVersion >= 0 else { return nil }
+        if let coarse, !["low", "medium", "high"].contains(coarse) { return nil }
+        return ConversionUpdate(fine: fine, coarse: coarse, lockWindow: lockWindow)
+    }
+}
+
+@_spi(Testing) public struct ServerConversionEnvelope: Codable, Equatable {
+    public let conversionUpdate: ServerConversionInstruction?
+
+    enum CodingKeys: String, CodingKey {
+        case conversionUpdate = "conversion_update"
+    }
+}
+
 @_spi(Testing) public enum ConversionEncoder {
     /// event + optional revenue (cents) → fine/coarse/lock. Mirrors the backend
     /// `encodeConversionValue`: revenue is linearly bucketed into the rule's fine

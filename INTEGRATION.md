@@ -1,6 +1,6 @@
 # TrackHub iOS SDK — подробное руководство по внедрению
 
-> **Версия инструкции:** TrackHub iOS SDK `1.10.2`, iOS 14+, проверено 7 августа 2026 г.
+> **Версия инструкции:** TrackHub iOS SDK `1.11.0`, iOS 14+, проверено 7 августа 2026 г.
 > Общая архитектура: [TrackHub SDK Integration Guide](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_INTEGRATION_GUIDE.md)
 > Контракт сервера: [SDK_CONTRACT.md](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/SDK_CONTRACT.md)
 > Диагностика: [TROUBLESHOOTING.md](https://github.com/Alexander-kuksa/trackhub/blob/main/docs/TROUBLESHOOTING.md)
@@ -25,9 +25,9 @@ deep links, события, покупки, APNs, Test Lab, outage и production
 | **App sessions** (automatic) | This SDK → `POST /ingest/{token}/sdk/session` on every foreground (60s coalescing). Powers DAU/WAU/MAU + retention. **No code beyond `configure`.** |
 | **Custom events** | `TrackHub.trackEvent("name")` → `POST /ingest/{token}/sdk/track`; shown in the app's **Engagement** tab + Raw Data |
 | **User-level attribution / erasure** | Host app's authenticated backend → TrackHub with the linked S2S secret; the SDK receives only the response, never that secret |
-| **App Conversion purchase bridge** | `TrackHub.trackPurchaseObserved(...)` sends transaction identity + short-lived device context; Apphud supplies authoritative value/currency |
+| **App Conversion purchase bridge** | Only when Google purchase mappings are enabled: `TrackHub.trackPurchaseObserved(...)` sends transaction identity + short-lived device context; Apphud supplies authoritative value/currency |
 | **Apple Search Ads attribution** | Dormant legacy contour; disabled by default in both SDK and backend |
-| **SKAdNetwork conversion values** (remote‑controlled via Conversion Hub) | This SDK applies the schema on‑device; schema edits in the UI need **no app release** |
+| **SKAdNetwork conversion values** (remote‑controlled via Conversion Hub) | The server recalculates Apphud/S2S lifecycle rules from canonical history; signed SDK responses contain only fine/coarse/lock bits, which this SDK applies on-device. Schema edits need **no app release** |
 | **Revenue / trials / subscriptions / refunds** | **Apphud/S2S → TrackHub** is the permanent financial source of truth; the SDK never sends client-authored money |
 
 So: this SDK makes **installs + sessions + custom events + SKAN/AdAttributionKit + Google device
@@ -87,12 +87,12 @@ TrackHub до первой конфигурации.
 
 **Xcode:** *File → Add Package Dependencies…* →
 `https://github.com/Alexander-kuksa/trackhub-sdk` → Dependency Rule: **Up to Next Major** from
-`1.10.2` → add the **`TrackHub`** library to your app target.
+`1.11.0` → add the **`TrackHub`** library to your app target.
 
 Or in a `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.10.2")
+.package(url: "https://github.com/Alexander-kuksa/trackhub-sdk", from: "1.11.0")
 // …and in the target's dependencies:
 .product(name: "TrackHub", package: "trackhub-sdk")
 ```
@@ -270,7 +270,7 @@ each launch. All work is async on a background queue; it never blocks the main t
 - callback хост-приложения имеет watchdog 15 секунд. Всегда вызывайте `completion` ровно один раз,
   но даже забытый callback не должен навсегда заблокировать SDK.
 
-SDK `1.10.2` безопасен при повторном `configure`: в одном namespace остаётся один
+SDK `1.11.0` безопасен при повторном `configure`: в одном namespace остаётся один
 queue instance. До first unlock новые reports не дропаются: они временно буферизуются в memory
 и атомарно сливаются с disk queue, когда protected storage становится доступным. One-shot click
 refs очищаются только после durable enqueue session; UIKit device snapshot всегда снимается на
@@ -454,16 +454,26 @@ phone, full name, price или currency. Максимальный SDK payload �
 быть allowlist-forwarded в `app_event_data`. `partnerParams` остаются внутри TrackHub. Не кладите
 туда поля «на всякий случай»: сначала определите владельца, срок хранения и consumer каждого поля.
 
-`track(…)` (without "Event") still exists for **SKAN‑only** conversion values — it does not send
-analytics. Prefer `trackEvent` for everything new. Events are persisted before delivery and drain one
-at a time with bounded backoff, including across later launches, so a flaky network never drops them.
+`track(…)` (without "Event") still exists as an advanced **SKAN‑only** manual update — it does not
+send analytics. Confirmed Apphud/S2S lifecycle events do not need to be mirrored with this method:
+the server evaluates exact event names under the active schema, and the next signed SDK response
+returns only the highest fine/coarse/lock bits for on-device application. In particular,
+`trial_started` cannot trigger a `trial_converted` rule. The SDK persists the greatest install fine
+and a separate coarse maximum for each Apple window. Lock stays sticky only inside the window in
+which the event occurred and never carries into the next one. Prefer `trackEvent` for new
+engagement events. Events are persisted before
+delivery and drain one at a time with bounded backoff,
+including across later launches, so a flaky network never drops them.
 
 Revenue/subscription tracking does **not** go through SDK events — Apphud/S2S webhooks are the
 source of truth. Current SDKs expose no revenue parameter on `trackEvent`.
 
-## Step 5 — Bridge a confirmed purchase to App Conversion
+## Step 5 — Bridge a confirmed purchase to Google App Conversion (conditional)
 
-After a successful store/Apphud purchase callback, pass the stable store transaction identity:
+Skip this entire step unless Google App Conversion purchase events are enabled for the app. Apphud
+S2S alone already supplies revenue analytics and server-calculated Apple conversion values. When
+the Google purchase mapping is enabled, pass the stable store transaction identity after a
+successful store/Apphud purchase callback:
 
 ```swift
 TrackHub.trackPurchaseObserved(
@@ -723,7 +733,7 @@ the app's data).
 
 ## Production checklist
 
-- [ ] Package закреплён на `1.10.2`, а не moving branch.
+- [ ] Package закреплён на `1.11.0`, а не moving branch.
 - [ ] iOS deployment target не ниже 14.
 - [ ] Production endpoint содержит только HTTPS origin.
 - [ ] Ingest token и SDK secret принадлежат правильному iOS app.
@@ -750,10 +760,10 @@ the app's data).
 
 ## Upgrade checklist
 
-При обновлении существующего приложения до `1.10.2`:
+При обновлении существующего приложения до `1.11.0`:
 
-1. Закрепите tag `1.10.2`, очистите Package Resolution только если Xcode всё ещё показывает
-   старую версию, затем убедитесь, что в install payload виден `sdk_version=1.10.2`.
+1. Закрепите tag `1.11.0`, очистите Package Resolution только если Xcode всё ещё показывает
+   старую версию, затем убедитесь, что в install payload виден `sdk_version=1.11.0`.
 2. Не меняйте `ingestToken`, `sdkSecret` или Apphud `userId` без серверной ротации и плана миграции.
 3. Добавьте backend callbacks для attribution/erasure; S2S secret никогда не переносите в приложение.
 4. Проверьте ATT, Apphud identifiers, deep links, APNs token и purchase observation на реальном устройстве.
