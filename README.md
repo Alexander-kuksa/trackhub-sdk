@@ -21,7 +21,7 @@ Add this package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select version `2.0.0` or a compatible `2.x` range.
+Select version `2.0.1` or a compatible `2.x` range.
 
 ## Start
 
@@ -88,6 +88,11 @@ TrackHub.handleDeepLink(url)
 The SDK captures bounded Google/ChatGPT Ads references without taking ownership
 of application navigation.
 
+iOS has no deterministic equivalent of Android Install Referrer. Therefore
+`resolveDeferredDeepLink` currently returns `nil` and must not be used for
+onboarding routing. Ordinary universal links continue to work through
+`handleDeepLink`.
+
 ## ATT and identifiers
 
 TrackHub never displays ATT automatically:
@@ -99,6 +104,10 @@ TrackHub.requestAppTrackingTransparency()
 Add `NSUserTrackingUsageDescription` and call only after a contextual
 explanation. IDFA is used only after authorization. IDFV and the authorized IDFA
 are synchronized to Apphud automatically.
+
+The SDK Key contains separate measurement/privacy and tracking origins. Without
+ATT authorization the SDK uses only the measurement origin; ATT-authorized
+tracking traffic uses the domain declared in `NSPrivacyTrackingDomains`.
 
 ## Consent updates
 
@@ -131,7 +140,8 @@ TrackHub.gdprForgetMe()
 
 This immediately disables local tracking, clears queued measurement and writes
 a crash-safe device-erasure task. Network failure does not re-enable tracking.
-The task retries on launch/foreground until TrackHub confirms `2xx` or `410`;
+This is durable even when called before `TrackHub.start` and remains disabled
+after SDK Key rotation. The task retries on launch/foreground until TrackHub confirms `2xx` or `410`;
 the per-install credential and install ID are deleted last.
 
 Erasure is installation-scoped. Account-wide erasure for a logged-in product is

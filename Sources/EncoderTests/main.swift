@@ -293,7 +293,7 @@ check(
 for url in quarantined { try? FileManager.default.removeItem(at: url) }
 
 check(
-    TrackHub.retryDelay(attempt: 1, jitter: 0) == 0.5 &&
+    TrackHub.retryDelay(attempt: 1, jitter: 0) == 0 &&
         TrackHub.retryDelay(attempt: 1, jitter: 1) == 1,
     "first retry uses bounded full-jitter backoff"
 )
@@ -322,7 +322,11 @@ check(
 
 // ── Host resilience when TrackHub is unavailable ────────────────────────────
 let outageToken = "outage-\(UUID().uuidString)"
-let outageNamespace = TrackHub.offlineQueueNamespace(for: outageToken)
+let outageIngestToken = "outage-test-ingest-token"
+let outageNamespace = TrackHub.offlineQueueNamespace(
+    for: outageToken,
+    ingestToken: outageIngestToken
+)
 let outageDirectory = (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
     ?? FileManager.default.temporaryDirectory).appendingPathComponent("TrackHub", isDirectory: true)
 let outageURL = outageDirectory.appendingPathComponent("trackhub_queue_\(outageNamespace).json")
@@ -331,7 +335,7 @@ let publicCallStarted = Date()
 var outageConfig = TrackHubConfig(
     sdkKey: sdkKey(
         endpoint: "http://127.0.0.1:9",
-        ingestToken: "outage-test-ingest-token",
+        ingestToken: outageIngestToken,
         sdkSecret: "outage-test-sdk-secret"
     ),
     environment: .testLab(token: outageToken)

@@ -6,10 +6,13 @@
     Privacy manifest for the TrackHub SDK. Shipping it here means apps that embed
     the SDK do NOT inherit undeclared data-use / required-reason-API obligations.
     When the host app explicitly requests ATT and receives authorization,
-    TrackHub reads IDFA for attribution and sends it to the configured TrackHub
-    endpoint and Apphud bridge. Without authorization it uses IDFV only as the
-    documented limited-tracking fallback. The host app remains responsible for
-    its consent UX, Apphud disclosure and App Store privacy answers.
+    TrackHub reads IDFA for attribution and sends tracking-eligible requests to
+    the tracking endpoint below and to the Apphud bridge. Without authorization
+    it uses the separate measurement/privacy endpoint from the SDK key, so iOS
+    can still deliver limited measurement and erasure. The host app remains
+    responsible for its consent UX, Apphud disclosure and App Store privacy
+    answers. Self-hosted builds must replace the domain below with their own
+    tracking origin before distribution.
   -->
   <key>NSPrivacyTracking</key>
   <true/>

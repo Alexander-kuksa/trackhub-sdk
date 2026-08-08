@@ -5,7 +5,8 @@ import XCTest
 final class TrackHubTests: XCTestCase {
     func testSdkKeyDecodesOnlyTheVersionedHttpsEnvelope() throws {
         let payload = try JSONSerialization.data(withJSONObject: [
-            "e": "https://postbacks.example.com",
+            "e": "https://measurement.example.com",
+            "t": "https://postbacks.example.com",
             "i": "ingest-token-with-enough-entropy",
             "s": "sdk-secret-with-enough-entropy",
         ])
@@ -14,9 +15,24 @@ final class TrackHubTests: XCTestCase {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         let decoded = try XCTUnwrap(DecodedTrackHubSdkKey.decode("thcfg_v1_" + encoded))
-        XCTAssertEqual(decoded.endpoint.absoluteString, "https://postbacks.example.com")
+        XCTAssertEqual(decoded.endpoint.absoluteString, "https://measurement.example.com")
+        XCTAssertEqual(decoded.trackingEndpoint?.absoluteString, "https://postbacks.example.com")
         XCTAssertEqual(decoded.ingestToken, "ingest-token-with-enough-entropy")
         XCTAssertNil(DecodedTrackHubSdkKey.decode("thcfg_v2_" + encoded))
+    }
+
+    func testSdkKeyRejectsUnsafeTrackingEndpoint() throws {
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "e": "https://measurement.example.com",
+            "t": "http://tracking.example.com",
+            "i": "ingest-token-with-enough-entropy",
+            "s": "sdk-secret-with-enough-entropy",
+        ])
+        let encoded = payload.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        XCTAssertNil(DecodedTrackHubSdkKey.decode("thcfg_v1_" + encoded))
     }
 
     func testInstallCredentialIsOpaqueAndInstallationScoped() {
@@ -27,6 +43,30 @@ final class TrackHubTests: XCTestCase {
             InstallCredentialStore.account(ingestToken: "token-a", installUid: "install-a"),
             InstallCredentialStore.account(ingestToken: "token-a", installUid: "install-b")
         )
+    }
+
+    func testOfflineQueuesAreAppScoped() {
+        XCTAssertNotEqual(
+            TrackHub.offlineQueueNamespace(for: nil, ingestToken: "app-token-a-with-enough-entropy"),
+            TrackHub.offlineQueueNamespace(for: nil, ingestToken: "app-token-b-with-enough-entropy")
+        )
+    }
+
+    func testConfigDescriptionRedactsCredentialsAndIdentifiers() {
+        let sdkKey = "thcfg_v1_secret-material"
+        let testToken = "test-lab-token-that-must-not-be-logged"
+        let firebaseId = "firebase-install-identifier"
+        var config = TrackHubConfig(sdkKey: sdkKey, environment: .testLab(token: testToken))
+        config.firebaseAppInstanceId = firebaseId
+        config.googleOnDeviceMeasurementInfo = "odm-sensitive-payload"
+
+        let rendered = config.description
+        XCTAssertFalse(rendered.contains(sdkKey))
+        XCTAssertFalse(rendered.contains(testToken))
+        XCTAssertFalse(rendered.contains(firebaseId))
+        XCTAssertFalse(rendered.contains("odm-sensitive-payload"))
+        XCTAssertTrue(rendered.contains("sdkKey=<redacted>"))
+        XCTAssertTrue(rendered.contains("testLab(<redacted>)"))
     }
 
     func testRetryIsBoundedAndClockSkewRequiresTheExplicitServerError() throws {
@@ -63,5 +103,34 @@ final class TrackHubTests: XCTestCase {
         let quarantined = try FileManager.default.contentsOfDirectory(atPath: directory.path)
             .contains { $0.hasPrefix("queue.json.corrupt-") }
         XCTAssertTrue(quarantined)
+    }
+
+    func testPrivacyRequestBeforeStartIsDurable() {
+        let defaults = UserDefaults.standard
+        let disabledKey = "trackhub.privacy_disabled.v2"
+        let pendingKey = "trackhub.privacy_pending.v2"
+        let installKey = "trackhub.install_uid"
+        defaults.removeObject(forKey: disabledKey)
+        defaults.removeObject(forKey: pendingKey)
+        defaults.removeObject(forKey: installKey)
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let file = root
+            .appendingPathComponent("TrackHub", isDirectory: true)
+            .appendingPathComponent("trackhub_privacy_v2.json")
+        try? FileManager.default.removeItem(at: file)
+        defer {
+            defaults.removeObject(forKey: disabledKey)
+            defaults.removeObject(forKey: pendingKey)
+            defaults.removeObject(forKey: installKey)
+            try? FileManager.default.removeItem(at: file)
+        }
+
+        TrackHub.gdprForgetMe()
+        XCTAssertTrue(defaults.bool(forKey: disabledKey))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: file.path)
+                || defaults.data(forKey: pendingKey) != nil
+        )
     }
 }

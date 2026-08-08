@@ -76,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "2.0.0"
+    public static let sdkVersion = "2.0.1"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -98,8 +98,6 @@ public enum TrackHub {
     private static var attributionFetchGeneration: UInt64 = 0
     private static let privacyStateLock = NSLock()
     private static var privacyStopRequested = false
-    private static var configuredPrivacyKey: String?
-    private static var configuredIngestToken: String?
     private static var privacyErasureInFlight = false
     private static var privacyRetryWorkItem: DispatchWorkItem?
     private static var privacyErasureCompletion: ((Bool) -> Void)?
@@ -117,6 +115,7 @@ public enum TrackHub {
 
     struct Config {
         let endpoint: URL
+        let trackingEndpoint: URL?
         let ingestToken: String
         var userId: String
         let sdkSecret: String?
@@ -130,6 +129,11 @@ public enum TrackHub {
         let endpoint: URL
         let ingestToken: String
         let sdkSecret: String?
+    }
+
+    private enum NetworkPurpose {
+        case measurement
+        case trackingEligible
     }
 
     private static let schemaCacheKey = "trackhub.cv_schema"
@@ -162,8 +166,10 @@ public enum TrackHub {
     private static let adAttributionConversionTagKey = "trackhub.ad_attribution.conversion_tag"
     private static let apphudAttributionRevisionKeyPrefix = "trackhub.apphud_attribution_revision."
     private static let apphudUserIdKeyPrefix = "trackhub.apphud_user_id."
-    private static let privacyDisabledKeyPrefix = "trackhub.privacy_disabled."
-    private static let privacyPendingKeyPrefix = "trackhub.privacy_pending."
+    private static let privacyDisabledKey = "trackhub.privacy_disabled.v2"
+    private static let privacyPendingKey = "trackhub.privacy_pending.v2"
+    private static let legacyPrivacyDisabledKeyPrefix = "trackhub.privacy_disabled."
+    private static let legacyPrivacyPendingKeyPrefix = "trackhub.privacy_pending."
     private static let iso8601 = ISO8601DateFormatter()
     private static let callbackTimeout: TimeInterval = 15
     private static let maxReportBytes = EventQueue.defaultMaxItemBytes
@@ -186,15 +192,9 @@ public enum TrackHub {
             return
         }
         let endpoint = decoded.endpoint
+        let trackingEndpoint = decoded.trackingEndpoint
         let ingestToken = decoded.ingestToken
         let sdkSecret = decoded.sdkSecret
-        // Publish the privacy namespace synchronously. A host is allowed to
-        // call gdprForgetMe() immediately after start(), before the main-actor
-        // Apphud snapshot and the serial configuration block have completed.
-        privacyStateLock.lock()
-        configuredPrivacyKey = privacyDisabledKey(token: ingestToken)
-        configuredIngestToken = ingestToken
-        privacyStateLock.unlock()
         // Refuse plaintext HTTP (token in transit + MITM schema poisoning); allow localhost for dev.
         guard endpoint.scheme == "https" || endpoint.host == "localhost" || endpoint.host == "127.0.0.1" else {
             print("[TrackHub] refusing non-HTTPS endpoint \(endpoint) — SDK not started")
@@ -206,6 +206,7 @@ public enum TrackHub {
             let apphudUserId = capturedApphudUserId.trimmingCharacters(in: .whitespacesAndNewlines)
             config = Config(
                 endpoint: endpoint,
+                trackingEndpoint: trackingEndpoint,
                 ingestToken: ingestToken,
                 userId: apphudUserId.isEmpty ? resolveDeviceId() : apphudUserId,
                 sdkSecret: sdkSecret,
@@ -219,10 +220,9 @@ public enum TrackHub {
             if let country = normalizedCountryCode(configuration.countryCode) {
                 UserDefaults.standard.set(country, forKey: countryCodeKey)
             }
-            var pendingPrivacyErasure = loadPendingErasure(token: ingestToken)
-            let persistedPrivacyStop = UserDefaults.standard.bool(
-                forKey: privacyDisabledKey(token: ingestToken)
-            )
+            migrateLegacyPrivacyState()
+            var pendingPrivacyErasure = loadPendingErasure()
+            let persistedPrivacyStop = UserDefaults.standard.bool(forKey: privacyDisabledKey)
             // Recover the narrow crash window between persisting the local
             // stop and committing its erasure job. A confirmed erasure has
             // already removed installUid, so it is not recreated.
@@ -231,15 +231,12 @@ public enum TrackHub {
                !retainedInstallUid.isEmpty,
                persistPendingErasure(
                     installUid: retainedInstallUid,
-                    reason: "user_requested",
-                    token: ingestToken
+                    reason: "user_requested"
                ) {
-                pendingPrivacyErasure = loadPendingErasure(token: ingestToken)
+                pendingPrivacyErasure = loadPendingErasure()
             }
-            let pendingPrivacyStateExists = hasPendingErasureState(token: ingestToken)
+            let pendingPrivacyStateExists = hasPendingErasureState()
             privacyStateLock.lock()
-            configuredPrivacyKey = privacyDisabledKey(token: ingestToken)
-            configuredIngestToken = ingestToken
             privacyStopRequested = privacyStopRequested
                 || persistedPrivacyStop
                 || pendingPrivacyStateExists
@@ -249,9 +246,15 @@ public enum TrackHub {
             // Load the durable queue before the privacy gate: if the process
             // crashed immediately after gdprForgetMe(), the next launch must
             // still remove already-buffered reports before any retry.
-            let namespace = offlineQueueNamespace(for: config?.integrationTestToken)
+            let namespace = offlineQueueNamespace(
+                for: config?.integrationTestToken,
+                ingestToken: ingestToken
+            )
             if eventQueue == nil || eventQueueNamespace != namespace {
-                eventQueue = EventQueue(url: queueFileURL(testToken: config?.integrationTestToken))
+                eventQueue = EventQueue(url: queueFileURL(
+                    testToken: config?.integrationTestToken,
+                    ingestToken: ingestToken
+                ))
                 eventQueueNamespace = namespace
             }
             if trackingDisabled {
@@ -370,31 +373,28 @@ public enum TrackHub {
     ) {
         privacyStateLock.lock()
         privacyStopRequested = true
-        let disabledKey = configuredPrivacyKey
-        let ingestToken = configuredIngestToken
         privacyStateLock.unlock()
         let boundedReason = String(reason.prefix(256))
-        let preparedInstallUid: String?
-        let preparedDurably: Bool
-        if let disabledKey, let ingestToken {
-            let installUid = resolveInstallUid()
-            UserDefaults.standard.set(true, forKey: disabledKey)
-            _ = UserDefaults.standard.synchronize()
-            preparedInstallUid = installUid
-            preparedDurably = persistPendingErasure(
-                installUid: installUid,
-                reason: boundedReason,
-                token: ingestToken
-            )
-        } else {
-            preparedInstallUid = nil
-            preparedDurably = false
+        // The privacy state belongs to this app installation, not to a
+        // rotatable SDK key. Persist it before consulting runtime config so a
+        // call made before start() is still crash-safe.
+        if UserDefaults.standard.bool(forKey: privacyDisabledKey),
+           !hasPendingErasureState(),
+           UserDefaults.standard.string(forKey: installUidKey) == nil {
+            DispatchQueue.main.async { completion?(true) }
+            return
         }
+        let preparedInstallUid = loadPendingErasure()?.installUid ?? resolveInstallUid()
+        UserDefaults.standard.set(true, forKey: privacyDisabledKey)
+        _ = UserDefaults.standard.synchronize()
+        let preparedDurably = loadPendingErasure() != nil || persistPendingErasure(
+            installUid: preparedInstallUid,
+            reason: boundedReason
+        )
         queue.async {
-            guard let config else {
-                // start() has decoded the key but its main-actor Apphud
-                // snapshot has not returned yet. Keep the completion pending;
-                // the start block will observe the durable job and retry it.
+            guard config != nil else {
+                trackingDisabled = true
+                stopAndClearLocalMeasurement(retainingInstallUid: preparedInstallUid)
                 if preparedDurably {
                     privacyErasureCompletion = completion
                 } else {
@@ -402,19 +402,17 @@ public enum TrackHub {
                 }
                 return
             }
-            let installUid = preparedInstallUid ?? resolveInstallUid()
             trackingDisabled = true
-            UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: config.ingestToken))
+            UserDefaults.standard.set(true, forKey: privacyDisabledKey)
             _ = UserDefaults.standard.synchronize()
-            if loadPendingErasure(token: config.ingestToken) == nil {
+            if loadPendingErasure() == nil {
                 _ = persistPendingErasure(
-                    installUid: installUid,
-                    reason: boundedReason,
-                    token: config.ingestToken
+                    installUid: preparedInstallUid,
+                    reason: boundedReason
                 )
             }
-            stopAndClearLocalMeasurement(retainingInstallUid: installUid)
-            guard loadPendingErasure(token: config.ingestToken) != nil else {
+            stopAndClearLocalMeasurement(retainingInstallUid: preparedInstallUid)
+            guard loadPendingErasure() != nil else {
                 privacyErasureCompletion = nil
                 return DispatchQueue.main.async { completion?(false) }
             }
@@ -1472,23 +1470,12 @@ public enum TrackHub {
         }
     }
 
-    private static func privacyDisabledKey(token: String) -> String {
-        let digest = SHA256.hash(data: Data(token.utf8))
-        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
-        return privacyDisabledKeyPrefix + suffix
-    }
-
     private struct PendingPrivacyErasure: Codable {
         let installUid: String
         let reason: String
         var attempts: Int
         var nextAttemptAt: TimeInterval
-    }
-
-    private static func privacyPendingKey(token: String) -> String {
-        let digest = SHA256.hash(data: Data(token.utf8))
-        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
-        return privacyPendingKeyPrefix + suffix
+        var launchOnly: Bool?
     }
 
     private static func isPrivacyStopRequested() -> Bool {
@@ -1497,65 +1484,106 @@ public enum TrackHub {
         return privacyStopRequested
     }
 
-    private static func pendingErasureFileURL(token: String) -> URL {
+    private static func privacyDirectoryURL() -> URL {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         let directory = root.appendingPathComponent("TrackHub", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let digest = SHA256.hash(data: Data(token.utf8))
-        let suffix = digest.prefix(12).map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent("trackhub_privacy_\(suffix).json")
+        return directory
     }
 
-    private static func hasPendingErasureState(token: String) -> Bool {
-        FileManager.default.fileExists(atPath: pendingErasureFileURL(token: token).path)
-            || UserDefaults.standard.object(forKey: privacyPendingKey(token: token)) != nil
+    private static func pendingErasureFileURL() -> URL {
+        privacyDirectoryURL().appendingPathComponent("trackhub_privacy_v2.json")
+    }
+
+    private static func hasPendingErasureState() -> Bool {
+        FileManager.default.fileExists(atPath: pendingErasureFileURL().path)
+            || UserDefaults.standard.object(forKey: privacyPendingKey) != nil
+    }
+
+    /// Migrate every token-scoped 2.0 prerelease state, not just the current
+    /// token. This is what keeps a pending erasure fail-closed across sdkKey
+    /// rotation.
+    private static func migrateLegacyPrivacyState() {
+        let defaults = UserDefaults.standard
+        let keys = defaults.dictionaryRepresentation().keys
+        if keys.contains(where: {
+            $0.hasPrefix(legacyPrivacyDisabledKeyPrefix)
+                && $0 != privacyDisabledKey
+                && defaults.bool(forKey: $0)
+        }) {
+            defaults.set(true, forKey: privacyDisabledKey)
+        }
+        guard loadPendingErasure() == nil else { return }
+
+        var candidates: [(Data, URL?, String?)] = []
+        let directory = privacyDirectoryURL()
+        if let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) {
+            for file in files where file.lastPathComponent.hasPrefix("trackhub_privacy_")
+                && file.lastPathComponent != "trackhub_privacy_v2.json" {
+                if let data = try? Data(contentsOf: file), data.count <= 1_024 {
+                    candidates.append((data, file, nil))
+                }
+            }
+        }
+        for key in keys where key.hasPrefix(legacyPrivacyPendingKeyPrefix) && key != privacyPendingKey {
+            if let data = defaults.data(forKey: key), data.count <= 1_024 {
+                candidates.append((data, nil, key))
+            }
+        }
+        for (data, file, key) in candidates {
+            guard let pending = try? JSONDecoder().decode(PendingPrivacyErasure.self, from: data),
+                  persistPendingErasure(pending) else { continue }
+            if let file { try? FileManager.default.removeItem(at: file) }
+            if let key { defaults.removeObject(forKey: key) }
+            defaults.set(true, forKey: privacyDisabledKey)
+            break
+        }
     }
 
     @discardableResult
-    private static func persistPendingErasure(installUid: String, reason: String, token: String) -> Bool {
+    private static func persistPendingErasure(installUid: String, reason: String) -> Bool {
         let pending = PendingPrivacyErasure(
             installUid: installUid,
             reason: reason,
             attempts: 0,
-            nextAttemptAt: 0
+            nextAttemptAt: 0,
+            launchOnly: false
         )
-        return persistPendingErasure(pending, token: token)
+        return persistPendingErasure(pending)
     }
 
     @discardableResult
-    private static func persistPendingErasure(_ pending: PendingPrivacyErasure, token: String) -> Bool {
+    private static func persistPendingErasure(_ pending: PendingPrivacyErasure) -> Bool {
         guard let data = try? JSONEncoder().encode(pending), data.count <= 1_024 else { return false }
         do {
-            try data.write(to: pendingErasureFileURL(token: token), options: .atomic)
-            UserDefaults.standard.removeObject(forKey: privacyPendingKey(token: token))
+            try data.write(to: pendingErasureFileURL(), options: .atomic)
+            UserDefaults.standard.removeObject(forKey: privacyPendingKey)
             return true
         } catch {
             // Application Support can be temporarily unavailable before first
             // unlock. Keep a second durable copy so a killed process still
             // resumes erasure; the next successful file write removes it.
-            UserDefaults.standard.set(data, forKey: privacyPendingKey(token: token))
+            UserDefaults.standard.set(data, forKey: privacyPendingKey)
             let stored = UserDefaults.standard.synchronize()
             if !stored { log("privacy erasure task could not be persisted") }
             return stored
         }
     }
 
-    private static func loadPendingErasure(token: String) -> PendingPrivacyErasure? {
-        let file = pendingErasureFileURL(token: token)
+    private static func loadPendingErasure() -> PendingPrivacyErasure? {
+        let file = pendingErasureFileURL()
         if let data = try? Data(contentsOf: file), data.count <= 1_024,
            let pending = try? JSONDecoder().decode(PendingPrivacyErasure.self, from: data) {
             return pending
         }
-        // One-time migration from the 1.12 prerelease implementation.
-        guard let legacy = UserDefaults.standard.data(forKey: privacyPendingKey(token: token)),
+        guard let legacy = UserDefaults.standard.data(forKey: privacyPendingKey),
               let pending = try? JSONDecoder().decode(PendingPrivacyErasure.self, from: legacy)
         else { return nil }
-        _ = persistPendingErasure(
-            installUid: pending.installUid,
-            reason: pending.reason,
-            token: token
-        )
+        _ = persistPendingErasure(pending)
         return pending
     }
 
@@ -1577,6 +1605,9 @@ public enum TrackHub {
             openAiOpprefKey, pendingOpenAiOpprefKey, appInstanceIdKey, odmInfoKey,
             adUserDataKey, adPersonalizationKey, eeaKey,
             piplConsentKey, crossBorderTransferConsentKey, adsMeasurementConsentKey,
+            countryCodeKey, adAttributionConversionTagKey,
+            installSentKey, firstOpenAtKey, schemaCacheKey,
+            highestInstallFineKey, "trackhub.session_seq", "trackhub.session_last_activity",
         ] {
             UserDefaults.standard.removeObject(forKey: key)
         }
@@ -1584,6 +1615,9 @@ public enum TrackHub {
             .filter {
                 $0.hasPrefix(apphudAttributionRevisionKeyPrefix)
                     || $0.hasPrefix(apphudUserIdKeyPrefix)
+                    || $0.hasPrefix(highestInstallCoarseKeyPrefix)
+                    || $0.hasPrefix(installWindowLockedKeyPrefix)
+                    || $0.hasPrefix(installCredentialBootstrapKeyPrefix)
             }
             .forEach { UserDefaults.standard.removeObject(forKey: $0) }
         if let retainingInstallUid {
@@ -1593,19 +1627,15 @@ public enum TrackHub {
         }
     }
 
-    private static func completePendingErasure(
-        _ pending: PendingPrivacyErasure,
-        token: String,
-        completion: ((Bool) -> Void)?
-    ) {
-        UserDefaults.standard.set(true, forKey: privacyDisabledKey(token: token))
+    private static func completePendingErasure(completion: ((Bool) -> Void)?) {
+        UserDefaults.standard.set(true, forKey: privacyDisabledKey)
         UserDefaults.standard.synchronize()
-        InstallCredentialStore.delete(ingestToken: token, installUid: pending.installUid)
+        InstallCredentialStore.deleteAll()
         // The credential and install id are erased last: both are required to
         // authorize/recover an offline privacy job.
         UserDefaults.standard.removeObject(forKey: installUidKey)
-        try? FileManager.default.removeItem(at: pendingErasureFileURL(token: token))
-        UserDefaults.standard.removeObject(forKey: privacyPendingKey(token: token))
+        try? FileManager.default.removeItem(at: pendingErasureFileURL())
+        UserDefaults.standard.removeObject(forKey: privacyPendingKey)
         privacyErasureInFlight = false
         privacyRetryWorkItem?.cancel()
         privacyRetryWorkItem = nil
@@ -1616,16 +1646,24 @@ public enum TrackHub {
 
     private static func schedulePendingErasureRetry(
         _ pending: PendingPrivacyErasure,
-        token: String,
-        completion: ((Bool) -> Void)?
+        completion: ((Bool) -> Void)?,
+        launchOnly: Bool = false
     ) {
         var updated = pending
         updated.attempts = min(pending.attempts + 1, 30)
-        let delay = retryDelay(attempt: updated.attempts, jitter: Double.random(in: 0...1))
+        updated.launchOnly = launchOnly
+        let delay = launchOnly
+            ? 24 * 60 * 60
+            : retryDelay(attempt: updated.attempts, jitter: Double.random(in: 0...1))
         updated.nextAttemptAt = Date().timeIntervalSince1970 + delay
-        _ = persistPendingErasure(updated, token: token)
+        _ = persistPendingErasure(updated)
         privacyErasureInFlight = false
         privacyRetryWorkItem?.cancel()
+        guard !launchOnly else {
+            privacyRetryWorkItem = nil
+            log("privacy erasure rejected — retry deferred until a later launch/foreground")
+            return
+        }
         let item = DispatchWorkItem { retryPendingErasure() }
         privacyRetryWorkItem = item
         queue.asyncAfter(deadline: .now() + delay, execute: item)
@@ -1635,9 +1673,9 @@ public enum TrackHub {
         if let completion { privacyErasureCompletion = completion }
         guard !privacyErasureInFlight,
               let config,
-              let networkConfig = currentNetworkConfig(),
-              let pending = loadPendingErasure(token: config.ingestToken) else {
-            if loadPendingErasure(token: config?.ingestToken ?? "") == nil {
+              let networkConfig = currentNetworkConfig(purpose: .measurement),
+              let pending = loadPendingErasure() else {
+            if loadPendingErasure() == nil {
                 let callback = completion ?? privacyErasureCompletion
                 privacyErasureCompletion = nil
                 DispatchQueue.main.async { callback?(false) }
@@ -1646,6 +1684,7 @@ public enum TrackHub {
         }
         let now = Date().timeIntervalSince1970
         guard pending.nextAttemptAt <= now else {
+            if pending.launchOnly == true { return }
             privacyRetryWorkItem?.cancel()
             let item = DispatchWorkItem { retryPendingErasure() }
             privacyRetryWorkItem = item
@@ -1656,7 +1695,7 @@ public enum TrackHub {
             "install_uid": pending.installUid,
             "reason": pending.reason,
         ]) else {
-            schedulePendingErasureRetry(pending, token: config.ingestToken, completion: completion)
+            schedulePendingErasureRetry(pending, completion: completion, launchOnly: true)
             return
         }
         privacyErasureInFlight = true
@@ -1669,11 +1708,15 @@ public enum TrackHub {
             ) { status, responseData in
                 queue.async {
                     if status.map(isSuccess) == true || status == 410 {
-                        completePendingErasure(pending, token: config.ingestToken, completion: completion)
+                        completePendingErasure(completion: completion)
                     } else if status == 401, !clockRetried, applyServerClock(responseData) {
                         recover(true)
                     } else {
-                        schedulePendingErasureRetry(pending, token: config.ingestToken, completion: completion)
+                        schedulePendingErasureRetry(
+                            pending,
+                            completion: completion,
+                            launchOnly: !isRetryable(status)
+                        )
                     }
                 }
             }
@@ -1694,7 +1737,7 @@ public enum TrackHub {
         ) { status, responseData in
             queue.async {
                 if status.map(isSuccess) == true || status == 410 {
-                    completePendingErasure(pending, token: config.ingestToken, completion: completion)
+                    completePendingErasure(completion: completion)
                 } else if status == 401 {
                     if applyServerClock(responseData) {
                         recover(true)
@@ -1702,7 +1745,11 @@ public enum TrackHub {
                         recover(false)
                     }
                 } else {
-                    schedulePendingErasureRetry(pending, token: config.ingestToken, completion: completion)
+                    schedulePendingErasureRetry(
+                        pending,
+                        completion: completion,
+                        launchOnly: !isRetryable(status)
+                    )
                 }
             }
         }
@@ -1724,13 +1771,24 @@ public enum TrackHub {
 
     // MARK: - Offline buffer + networking
 
-    @_spi(Testing) public static func offlineQueueNamespace(for testToken: String?) -> String {
-        guard let token = testToken, !token.isEmpty else { return "production" }
-        let digest = SHA256.hash(data: Data(token.utf8))
-        return "test-" + digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+    @_spi(Testing) public static func offlineQueueNamespace(
+        for testToken: String?,
+        ingestToken: String? = nil
+    ) -> String {
+        let environment: String
+        if let token = testToken, !token.isEmpty {
+            let digest = SHA256.hash(data: Data(token.utf8))
+            environment = "test-" + digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        } else {
+            environment = "production"
+        }
+        guard let ingestToken, !ingestToken.isEmpty else { return environment }
+        let appDigest = SHA256.hash(data: Data(ingestToken.utf8))
+        let app = appDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(environment)-app-\(app)"
     }
 
-    private static func queueFileURL(testToken: String?) -> URL {
+    private static func queueFileURL(testToken: String?, ingestToken: String) -> URL {
         let manager = FileManager.default
         let base = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? manager.temporaryDirectory
@@ -1740,18 +1798,25 @@ public enum TrackHub {
         resourceValues.isExcludedFromBackup = true
         var mutableDir = dir
         try? mutableDir.setResourceValues(resourceValues)
-        let namespace = offlineQueueNamespace(for: testToken)
-        // Preserve the pre-Test-Lab production filename so an SDK upgrade still
-        // drains already-buffered real events.
-        let filename = namespace == "production" ? "trackhub_queue.json" : "trackhub_queue_\(namespace).json"
+        let namespace = offlineQueueNamespace(for: testToken, ingestToken: ingestToken)
+        let filename = "trackhub_queue_\(namespace).json"
         let destination = dir.appendingPathComponent(filename)
-        // Caches may be purged by iOS. Migrate the pre-1.10.2 queue once into
-        // durable Application Support before constructing EventQueue.
-        if !manager.fileExists(atPath: destination.path),
-           let oldCaches = manager.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            let legacy = oldCaches.appendingPathComponent(filename)
-            if manager.fileExists(atPath: legacy.path) {
-                try? manager.moveItem(at: legacy, to: destination)
+        // One-time migration from the environment-only 2.0 queue and the older
+        // Caches location. The current key is the only safe app association we
+        // can infer for those legacy files.
+        if !manager.fileExists(atPath: destination.path) {
+            let legacyNamespace = offlineQueueNamespace(for: testToken)
+            let legacyFilename = legacyNamespace == "production"
+                ? "trackhub_queue.json"
+                : "trackhub_queue_\(legacyNamespace).json"
+            let legacyApplicationSupport = dir.appendingPathComponent(legacyFilename)
+            if manager.fileExists(atPath: legacyApplicationSupport.path) {
+                try? manager.moveItem(at: legacyApplicationSupport, to: destination)
+            } else if let oldCaches = manager.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                let legacyCaches = oldCaches.appendingPathComponent(legacyFilename)
+                if manager.fileExists(atPath: legacyCaches.path) {
+                    try? manager.moveItem(at: legacyCaches, to: destination)
+                }
             }
         }
         return destination
@@ -1937,7 +2002,7 @@ public enum TrackHub {
         let exponent = min(max(0, attempt - 1), 9)
         let cap = min(retryMaxInterval, retryBaseInterval * pow(2, Double(exponent)))
         let unit = min(max(0, jitter.isFinite ? jitter : 0), 1)
-        return cap / 2 + (cap / 2 * unit)
+        return cap * unit
     }
 
     private static func resolveDeviceId() -> String {
@@ -2159,13 +2224,31 @@ public enum TrackHub {
         return true
     }
 
-    private static func currentNetworkConfig() -> NetworkConfig? {
+    private static func currentNetworkConfig(
+        purpose: NetworkPurpose = .trackingEligible
+    ) -> NetworkConfig? {
         guard let config else { return nil }
+        let endpoint: URL
+        if purpose == .trackingEligible,
+           isTrackingAuthorized(),
+           let trackingEndpoint = config.trackingEndpoint {
+            endpoint = trackingEndpoint
+        } else {
+            endpoint = config.endpoint
+        }
         return NetworkConfig(
-            endpoint: config.endpoint,
+            endpoint: endpoint,
             ingestToken: config.ingestToken,
             sdkSecret: config.sdkSecret
         )
+    }
+
+    private static func isTrackingAuthorized() -> Bool {
+        #if os(iOS) && canImport(AppTrackingTransparency)
+        return ATTrackingManager.trackingAuthorizationStatus == .authorized
+        #else
+        return false
+        #endif
     }
 
     private static func postRaw(

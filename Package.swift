@@ -11,7 +11,7 @@ let package = Package(
         .library(name: "TrackHub", targets: ["TrackHub"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apphud/ApphudSDK", from: "4.4.8"),
+        .package(url: "https://github.com/apphud/ApphudSDK", exact: "4.4.8"),
     ],
     targets: [
         .target(

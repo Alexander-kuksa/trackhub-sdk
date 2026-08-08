@@ -64,7 +64,7 @@ login therefore changes the binding without creating a second installation.
 | `setGoogleClickIds` | Explicit Google reference handoff for wrappers |
 | `setPushToken` | Forward APNs token; TrackHub never requests permission |
 | `attribution` | Read durable device-scoped attribution snapshot |
-| `resolveDeferredDeepLink` | Resolve a supported deterministic deferred path |
+| `resolveDeferredDeepLink` | Reserved API; returns `nil` on iOS until a deterministic handoff exists |
 | `requestAppTrackingTransparency` | Host-triggered ATT prompt |
 | `updateGoogleAdsConsent` | Change Google consent after startup |
 | `updatePIPLConsent` | Change PIPL consent after startup |
@@ -121,6 +121,8 @@ from `TrackHub.start`.
 `gdprForgetMe` persists a small atomic job under Application Support before
 network delivery, stops public tracking, clears all measurement identifiers and
 retains only `install_uid` plus the private credential needed for erasure.
+The privacy state is installation-scoped rather than SDK-Key-scoped, so it is
+durable before `start` and cannot be reset by credential rotation.
 
 Direct credential failure falls back to endpoint-bound HMAC recovery. One clock
 correction is allowed per attempt; persistent auth failure backs off and remains

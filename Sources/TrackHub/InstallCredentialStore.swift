@@ -64,6 +64,19 @@ import Security
         #endif
     }
 
+    /// Privacy erasure must also remove credentials left under a rotated SDK
+    /// key. The Keychain service is private to this app, so deleting the whole
+    /// service is both narrower and safer than trying to rediscover old token
+    /// hashes after rotation.
+    public static func deleteAll() {
+        #if canImport(Security)
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ] as CFDictionary)
+        #endif
+    }
+
     #if canImport(Security)
     private static func baseQuery(ingestToken: String, installUid: String) -> [String: Any] {
         [
