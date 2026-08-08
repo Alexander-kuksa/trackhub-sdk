@@ -21,7 +21,7 @@ Add this package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select version `2.0.2` or a compatible `2.x` range.
+Select version `2.0.3` or a compatible `2.x` range.
 
 ## Start
 
@@ -80,6 +80,29 @@ TrackHub.trackPurchaseObserved(transaction)
 
 This sends no money. TrackHub joins the transaction to authoritative Apphud
 value/currency on the server.
+
+If the app must operate without access to configure App Store Server
+Notifications, also send StoreKit's Apple-signed JWS after a verified purchase:
+
+```swift
+switch purchaseResult {
+case .success(let verification):
+    switch verification {
+    case .verified:
+        TrackHub.trackVerifiedPurchase(signedTransaction: verification.jwsRepresentation)
+    case .unverified:
+        break
+    }
+default:
+    break
+}
+```
+
+The SDK durably queues the JWS; Daively verifies Apple's signature again. With
+an In-App Purchase API key linked to the app, the worker then reconciles known
+subscriptions through App Store Server API. This is the Adjust-style key-only
+purchase contour. It is reliable for submitted purchases but periodic, not a
+replacement for real-time ASSN delivery of events the device never observes.
 
 ## Deep links
 

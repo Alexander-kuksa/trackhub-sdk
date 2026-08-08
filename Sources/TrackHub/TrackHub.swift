@@ -76,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "2.0.2"
+    public static let sdkVersion = "2.0.3"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -867,6 +867,50 @@ public enum TrackHub {
                 )
             )
         }
+    }
+
+    /// Durably uploads StoreKit 2's Apple-signed transaction for independent
+    /// server verification. This is the key-only/Adjust-style purchase contour:
+    /// it does not require an App Store Server Notifications URL. When an
+    /// In-App Purchase API key is linked in Daively, the server seeds the
+    /// subscription and periodically reconciles later renewals/refunds through
+    /// App Store Server API. ASSN remains the lower-latency optional contour.
+    ///
+    /// Pass `VerificationResult.jwsRepresentation` from the successful StoreKit
+    /// purchase. Daively verifies Apple's certificate chain again and counts
+    /// revenue only when SDK Signature is configured and valid.
+    public static func trackVerifiedPurchase(signedTransaction: String) {
+        let value = signedTransaction.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty,
+              value.utf8.count <= 16 * 1024,
+              !isPrivacyStopRequested()
+        else { return }
+        queue.async {
+            refreshApphudIdentity()
+            guard let config else { return log("trackVerifiedPurchase before start — skipped") }
+            guard config.sdkSecret?.isEmpty == false else {
+                return log("trackVerifiedPurchase requires sdkSecret — skipped")
+            }
+            send(
+                path: "sdk/purchase",
+                body: verifiedPurchaseBody(
+                    signedTransaction: value,
+                    userId: config.userId
+                )
+            )
+        }
+    }
+
+    @_spi(Testing) public static func verifiedPurchaseBody(
+        signedTransaction: String,
+        userId: String,
+        occurredAt: Date = Date()
+    ) -> [String: Any] {
+        [
+            "signed_transaction": signedTransaction,
+            "user_id": userId,
+            "occurred_at": iso8601.string(from: occurredAt),
+        ]
     }
 
     #if canImport(StoreKit)

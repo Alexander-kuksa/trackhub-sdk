@@ -60,6 +60,7 @@ login therefore changes the binding without creating a second installation.
 | `trackPaywallShown(at:)` | Canonical paywall impression with placement |
 | `trackPurchaseCtaTapped(at:)` | Canonical CTA tap with placement |
 | `trackPurchaseObserved` | Short-lived StoreKit transaction/device context; no money |
+| `trackVerifiedPurchase(signedTransaction:)` | Durable Apple-signed purchase verification; seeds key-only server reconciliation |
 | `handleDeepLink` | Capture bounded ad references, leave routing to host |
 | `setGoogleClickIds` | Explicit Google reference handoff for wrappers |
 | `setPushToken` | Forward APNs token; TrackHub never requests permission |
@@ -136,7 +137,9 @@ last and the durable local disabled state remains.
 3. Run a clean isolated Test Lab install.
 4. Verify install precedes session in the timeline.
 5. Trigger a paywall and custom event.
-6. Complete an Apphud sandbox purchase.
+6. Complete an Apphud sandbox purchase. If key-only Apple purchase verification
+   is enabled, also pass `VerificationResult.jwsRepresentation` to
+   `trackVerifiedPurchase(signedTransaction:)`.
 7. Turn network off, enqueue events, terminate, relaunch, restore network and
    verify the queue drains once.
 8. Turn network off, call `gdprForgetMe`, terminate, relaunch online and verify
