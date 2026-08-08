@@ -76,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "2.0.3"
+    public static let sdkVersion = "2.0.4"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -900,6 +900,37 @@ public enum TrackHub {
             )
         }
     }
+
+    #if canImport(StoreKit)
+    /// Convenience for a native StoreKit 2 purchase result. Unverified
+    /// transactions are ignored; the server still performs its own independent
+    /// Apple-chain verification before the transaction can count.
+    @available(iOS 15.0, macOS 12.0, *)
+    public static func trackVerifiedPurchase(
+        _ verification: VerificationResult<StoreKit.Transaction>
+    ) {
+        guard case .verified = verification else { return }
+        trackVerifiedPurchase(signedTransaction: verification.jwsRepresentation)
+    }
+
+    /// Convenience for Apphud's `transactionV2`. Apphud exposes the verified
+    /// StoreKit transaction after unwrapping `VerificationResult`, so recover
+    /// Apple's signed representation from StoreKit and require the exact same
+    /// transaction id before uploading it.
+    @available(iOS 15.0, macOS 12.0, *)
+    public static func trackVerifiedPurchase(_ transaction: StoreKit.Transaction) {
+        Task(priority: .utility) {
+            guard let verification = await StoreKit.Transaction.latest(for: transaction.productID),
+                  case .verified(let latest) = verification,
+                  latest.id == transaction.id
+            else {
+                log("could not recover verified StoreKit JWS — skipped")
+                return
+            }
+            trackVerifiedPurchase(verification)
+        }
+    }
+    #endif
 
     @_spi(Testing) public static func verifiedPurchaseBody(
         signedTransaction: String,
