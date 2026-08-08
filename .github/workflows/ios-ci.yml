@@ -13,6 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: swift --version
       - run: swift build
+      - run: swift test
       - run: swift run encoder-tests
       - name: Compile for iOS Simulator
         run: xcodebuild -scheme TrackHub -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build

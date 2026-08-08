@@ -35,6 +35,13 @@ final class TrackHubTests: XCTestCase {
         XCTAssertNil(DecodedTrackHubSdkKey.decode("thcfg_v1_" + encoded))
     }
 
+    func testServerPrivacyStopRequiresExplicitErasureError() {
+        XCTAssertTrue(TrackHub.isServerPrivacyStop(Data("{\"error\":\"device_erased\"}".utf8)))
+        XCTAssertTrue(TrackHub.isServerPrivacyStop(Data("{\"error\":\"privacy_erased\"}".utf8)))
+        XCTAssertFalse(TrackHub.isServerPrivacyStop(Data("{\"error\":\"invalid_payload\"}".utf8)))
+        XCTAssertFalse(TrackHub.isServerPrivacyStop(nil))
+    }
+
     func testInstallCredentialIsOpaqueAndInstallationScoped() {
         let credential = "thic_v1_" + String(repeating: "A", count: 43)
         XCTAssertTrue(InstallCredentialStore.isValid(credential))

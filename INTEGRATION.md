@@ -153,3 +153,10 @@ Replace all startup values with one SDK Key. Rename:
 - consent/country setters → `update...` methods.
 
 Do not keep two TrackHub startup paths in one binary.
+
+### SKAN lock-window limitation
+
+When Apple supplies no coarse conversion value, the SDK does not manufacture
+`.low` merely to call the richer `updatePostbackConversionValue` overload.
+Consequently `lockWindow` cannot be expressed on that absent-coarse path. This
+is a deliberate fail-closed trade-off; AAK delivery remains unaffected.

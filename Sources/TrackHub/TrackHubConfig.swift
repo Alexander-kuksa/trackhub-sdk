@@ -57,6 +57,14 @@ public struct TrackHubPIPLConsent: Sendable, Equatable {
     }
 }
 
+public enum TrackHubDeliveryFailure: Sendable, Equatable {
+    /// The server rejected the SDK credential after clock-skew recovery. The
+    /// host should ship a build containing the currently issued SDK Key.
+    case credentialsRejected(path: String)
+}
+
+public typealias TrackHubDeliveryFailureHandler = @Sendable (TrackHubDeliveryFailure) -> Void
+
 public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public let sdkKey: String
     public let environment: TrackHubEnvironment
@@ -69,6 +77,7 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public var googleOnDeviceMeasurementInfo: String?
     public var attributionChangedHandler: TrackHubAttributionChangedHandler?
     public var deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
+    public var deliveryFailureHandler: TrackHubDeliveryFailureHandler?
 
     public init(sdkKey: String, environment: TrackHubEnvironment = .production) {
         self.sdkKey = sdkKey
@@ -92,7 +101,8 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
             "firebaseAppInstanceId=\(firebaseAppInstanceId == nil ? "nil" : "<redacted>"), " +
             "googleOnDeviceMeasurementInfo=\(googleOnDeviceMeasurementInfo == nil ? "nil" : "<redacted>"), " +
             "attributionChangedHandler=\(attributionChangedHandler != nil), " +
-            "deferredDeepLinkHandler=\(deferredDeepLinkHandler != nil))"
+            "deferredDeepLinkHandler=\(deferredDeepLinkHandler != nil), " +
+            "deliveryFailureHandler=\(deliveryFailureHandler != nil))"
     }
 }
 
@@ -120,8 +130,16 @@ struct DecodedTrackHubSdkKey: Decodable, Equatable {
               ingestToken.count >= 20, sdkSecret.count >= 20 else {
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "invalid sdkKey"))
         }
+        let trackingEndpoint = trackingEndpointString.flatMap(Self.validEndpoint)
+        if let trackingEndpoint,
+           endpoint.host?.lowercased() == trackingEndpoint.host?.lowercased() {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "measurement and tracking hosts must differ"))
+        }
+        if endpoint.host?.lowercased() == "postbacks.daively.com" {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "measurement host is declared as tracking"))
+        }
         self.endpoint = endpoint
-        self.trackingEndpoint = trackingEndpointString.flatMap(Self.validEndpoint)
+        self.trackingEndpoint = trackingEndpoint
         self.ingestToken = ingestToken
         self.sdkSecret = sdkSecret
     }

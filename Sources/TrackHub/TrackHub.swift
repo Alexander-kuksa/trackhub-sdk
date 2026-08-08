@@ -76,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "2.0.1"
+    public static let sdkVersion = "2.0.2"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -94,6 +94,7 @@ public enum TrackHub {
     // response. Queued events are always signed immediately before delivery.
     private static var clockOffsetMilliseconds: Int64 = 0
     private static var deliveryCompletions: [String: (Int?) -> Void] = [:]
+    private static var credentialsFailureSignaled = false
     private static var apphudAttributionFetchInFlight = false
     private static var attributionFetchGeneration: UInt64 = 0
     private static let privacyStateLock = NSLock()
@@ -123,6 +124,7 @@ public enum TrackHub {
         let attConsentWaitingInterval: TimeInterval
         let attributionChangedHandler: TrackHubAttributionChangedHandler?
         let deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
+        let deliveryFailureHandler: TrackHubDeliveryFailureHandler?
     }
 
     private struct NetworkConfig {
@@ -213,8 +215,10 @@ public enum TrackHub {
                 integrationTestToken: configuration.environment.testToken,
                 attConsentWaitingInterval: normalizedATTConsentWaitingInterval(configuration.attConsentWaitingInterval),
                 attributionChangedHandler: configuration.attributionChangedHandler,
-                deferredDeepLinkHandler: configuration.deferredDeepLinkHandler
+                deferredDeepLinkHandler: configuration.deferredDeepLinkHandler,
+                deliveryFailureHandler: configuration.deliveryFailureHandler
             )
+            credentialsFailureSignaled = false
             persistGoogleAdsConsent(configuration.googleAdsConsent)
             persistPIPLConsent(configuration.piplConsent)
             if let country = normalizedCountryCode(configuration.countryCode) {
@@ -396,7 +400,7 @@ public enum TrackHub {
                 trackingDisabled = true
                 stopAndClearLocalMeasurement(retainingInstallUid: preparedInstallUid)
                 if preparedDurably {
-                    privacyErasureCompletion = completion
+                    addPrivacyErasureCompletion(completion)
                 } else {
                     DispatchQueue.main.async { completion?(false) }
                 }
@@ -413,10 +417,12 @@ public enum TrackHub {
             }
             stopAndClearLocalMeasurement(retainingInstallUid: preparedInstallUid)
             guard loadPendingErasure() != nil else {
+                let callback = privacyErasureCompletion
                 privacyErasureCompletion = nil
+                DispatchQueue.main.async { callback?(false) }
                 return DispatchQueue.main.async { completion?(false) }
             }
-            privacyErasureCompletion = completion
+            addPrivacyErasureCompletion(completion)
             retryPendingErasure()
         }
     }
@@ -1599,6 +1605,7 @@ public enum TrackHub {
         if eventQueue?.removeAll() == false {
             log("privacy erasure could not clear the offline queue")
         }
+        purgeAllOfflineQueueFiles()
         for key in [
             pushTokenKey, pushEnvironmentKey, deviceIdKey,
             gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
@@ -1627,6 +1634,34 @@ public enum TrackHub {
         }
     }
 
+    private static func purgeAllOfflineQueueFiles() {
+        let directory = privacyDirectoryURL()
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else { return }
+        for file in files {
+            let name = file.lastPathComponent
+            if name == "trackhub_queue.json"
+                || name.hasPrefix("trackhub_queue_")
+                || name.contains(".json.corrupt-") {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+    }
+
+    private static func addPrivacyErasureCompletion(_ completion: ((Bool) -> Void)?) {
+        guard let completion else { return }
+        if let previous = privacyErasureCompletion {
+            privacyErasureCompletion = { success in
+                previous(success)
+                completion(success)
+            }
+        } else {
+            privacyErasureCompletion = completion
+        }
+    }
+
     private static func completePendingErasure(completion: ((Bool) -> Void)?) {
         UserDefaults.standard.set(true, forKey: privacyDisabledKey)
         UserDefaults.standard.synchronize()
@@ -1639,7 +1674,8 @@ public enum TrackHub {
         privacyErasureInFlight = false
         privacyRetryWorkItem?.cancel()
         privacyRetryWorkItem = nil
-        let callback = completion ?? privacyErasureCompletion
+        addPrivacyErasureCompletion(completion)
+        let callback = privacyErasureCompletion
         privacyErasureCompletion = nil
         DispatchQueue.main.async { callback?(true) }
     }
@@ -1670,13 +1706,13 @@ public enum TrackHub {
     }
 
     private static func retryPendingErasure(completion: ((Bool) -> Void)? = nil) {
-        if let completion { privacyErasureCompletion = completion }
+        addPrivacyErasureCompletion(completion)
         guard !privacyErasureInFlight,
               let config,
               let networkConfig = currentNetworkConfig(purpose: .measurement),
               let pending = loadPendingErasure() else {
             if loadPendingErasure() == nil {
-                let callback = completion ?? privacyErasureCompletion
+                let callback = privacyErasureCompletion
                 privacyErasureCompletion = nil
                 DispatchQueue.main.async { callback?(false) }
             }
@@ -1928,6 +1964,20 @@ public enum TrackHub {
             deliveryCompletions.removeValue(forKey: report.id)
             return
         }
+        if status == 410, isServerPrivacyStop(responseData) {
+            let completion = deliveryCompletions.removeValue(forKey: report.id)
+            privacyStateLock.lock()
+            privacyStopRequested = true
+            privacyStateLock.unlock()
+            trackingDisabled = true
+            UserDefaults.standard.set(true, forKey: privacyDisabledKey)
+            _ = UserDefaults.standard.synchronize()
+            stopAndClearLocalMeasurement(retainingInstallUid: nil)
+            InstallCredentialStore.deleteAll()
+            log("server privacy erasure confirmed — tracking permanently disabled")
+            completion?(status)
+            return
+        }
         let correctedClock = status == 401 && applyServerClock(responseData)
         if correctedClock || isRetryable(status) {
             let attempts = report.attempts + 1
@@ -1949,6 +1999,15 @@ public enum TrackHub {
                 ? "device clock corrected — retrying \(report.path)"
                 : "\(report.path) delivery failed — retrying with backoff")
             return
+        }
+
+        if status == 401, !credentialsFailureSignaled {
+            credentialsFailureSignaled = true
+            if let handler = config?.deliveryFailureHandler {
+                let failure = TrackHubDeliveryFailure.credentialsRejected(path: report.path)
+                DispatchQueue.main.async { handler(failure) }
+            }
+            log("SDK credentials rejected after clock recovery — host notified")
         }
 
         if !targetQueue.remove(id: report.id) {
@@ -1977,6 +2036,14 @@ public enum TrackHub {
             log("\(report.path) rejected with HTTP \(status ?? 0) — not retried")
         }
         completion?(status)
+    }
+
+    @_spi(Testing) public static func isServerPrivacyStop(_ responseData: Data?) -> Bool {
+        guard let responseData,
+              let value = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+              let error = value["error"] as? String
+        else { return false }
+        return error == "device_erased" || error == "privacy_erased"
     }
 
     private static func scheduleRetry(at date: Date) {

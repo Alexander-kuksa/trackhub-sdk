@@ -21,7 +21,7 @@ Add this package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select version `2.0.1` or a compatible `2.x` range.
+Select version `2.0.2` or a compatible `2.x` range.
 
 ## Start
 
@@ -34,6 +34,10 @@ import TrackHub
 Apphud.start(apiKey: "<APPHUD_API_KEY>")
 
 var config = TrackHubConfig(sdkKey: "<TRACKHUB_SDK_KEY>")
+config.deliveryFailureHandler = { failure in
+    // Surface a diagnostic and release an app build with the current SDK Key.
+    print("TrackHub delivery configuration requires attention: \(failure)")
+}
 config.countryCode = "DE" // actual measurement country, not UI language
 config.googleAdsConsent = TrackHubGoogleAdsConsent(
     adUserData: .granted,
