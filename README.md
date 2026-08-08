@@ -21,7 +21,7 @@ Add this package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select version `2.0.4` or a compatible `2.x` range.
+Select version `2.0.5` or a compatible `2.x` range.
 
 ## Start
 
@@ -81,39 +81,12 @@ TrackHub.trackPurchaseObserved(transaction)
 This sends no money. TrackHub joins the transaction to authoritative Apphud
 value/currency on the server.
 
-If the app must operate without access to configure App Store Server
-Notifications, also send the verified StoreKit result:
-
-```swift
-switch purchaseResult {
-case .success(let verification):
-    switch verification {
-    case .verified:
-        TrackHub.trackVerifiedPurchase(verification)
-    case .unverified:
-        break
-    }
-default:
-    break
-}
-```
-
-Apphud unwraps that result before returning it. Pass its StoreKit 2 transaction;
-the SDK safely recovers the matching signed representation:
-
-```swift
-Apphud.purchase(product) { result in
-    if let transaction = result.transactionV2 {
-        TrackHub.trackVerifiedPurchase(transaction)
-    }
-}
-```
-
-The SDK durably queues Apple's JWS; Daively verifies the signature again. With
-an In-App Purchase API key linked to the app, the worker then reconciles known
-subscriptions through App Store Server API. This is the Adjust-style key-only
-purchase contour. It is reliable for submitted purchases but periodic, not a
-replacement for real-time ASSN delivery of events the device never observes.
+No purchase-result adapter is required. The authenticated Apphud webhook (or a
+first-party S2S event) supplies the transaction identity to Daively. With an
+In-App Purchase API key linked to the app, the server verifies that transaction
+directly through App Store Server API and seeds later reconciliation. This path
+does not call `transactionV2` and is independent of the Apphud SDK version used
+by the host app. ASSN remains the optional lower-latency notification path.
 
 ## Deep links
 

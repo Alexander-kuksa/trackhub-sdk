@@ -59,20 +59,6 @@ final class TrackHubTests: XCTestCase {
         )
     }
 
-    func testVerifiedPurchaseBodyCarriesOnlyAppleJwsAndJoinContext() throws {
-        let body = TrackHub.verifiedPurchaseBody(
-            signedTransaction: "header.payload.signature",
-            userId: "apphud-user",
-            occurredAt: Date(timeIntervalSince1970: 1_800_000_000)
-        )
-        XCTAssertEqual(body["signed_transaction"] as? String, "header.payload.signature")
-        XCTAssertEqual(body["user_id"] as? String, "apphud-user")
-        XCTAssertNotNil(body["occurred_at"] as? String)
-        XCTAssertNil(body["revenue_cents"])
-        XCTAssertNil(body["currency"])
-        XCTAssertNil(body["product_id"])
-    }
-
     func testConfigDescriptionRedactsCredentialsAndIdentifiers() {
         let sdkKey = "thcfg_v1_secret-material"
         let testToken = "test-lab-token-that-must-not-be-logged"
