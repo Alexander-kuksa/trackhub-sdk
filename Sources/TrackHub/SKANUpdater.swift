@@ -33,12 +33,20 @@ enum SKANUpdater {
                 default: return nil
                 }
             }
-            SKAdNetwork.updatePostbackConversionValue(
-                update.fine,
-                coarseValue: coarse ?? .low,
-                lockWindow: update.lockWindow
-            ) { error in
-                if let error { TrackHub.log("SKAN update failed: \(error.localizedDescription)") }
+            if let coarse {
+                SKAdNetwork.updatePostbackConversionValue(
+                    update.fine,
+                    coarseValue: coarse,
+                    lockWindow: update.lockWindow
+                ) { error in
+                    if let error { TrackHub.log("SKAN update failed: \(error.localizedDescription)") }
+                }
+            } else {
+                // Absence is meaningful: do not manufacture `.low` when the
+                // server schema intentionally has no coarse conversion value.
+                SKAdNetwork.updatePostbackConversionValue(update.fine) { error in
+                    if let error { TrackHub.log("SKAN update failed: \(error.localizedDescription)") }
+                }
             }
         } else if #available(iOS 15.4, *) {
             SKAdNetwork.updatePostbackConversionValue(update.fine) { error in
