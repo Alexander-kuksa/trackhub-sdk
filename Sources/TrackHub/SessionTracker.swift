@@ -28,7 +28,7 @@ import Foundation
     /// On foreground: returns a `SessionStart` when a NEW session began, else nil.
     public func foreground(at now: Date = Date()) -> SessionStart? {
         let last = defaults.object(forKey: lastActivityKey) as? Date
-        let isNew = last == nil || now.timeIntervalSince(last!) > timeout
+        let isNew = last.map { now.timeIntervalSince($0) > timeout } ?? true
         defaults.set(now, forKey: lastActivityKey)
         guard isNew else { return nil }
         let seq = defaults.integer(forKey: seqKey) + 1

@@ -76,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "2.0.5"
+    public static let sdkVersion = "2.0.6"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -172,11 +172,20 @@ public enum TrackHub {
     private static let privacyPendingKey = "trackhub.privacy_pending.v2"
     private static let legacyPrivacyDisabledKeyPrefix = "trackhub.privacy_disabled."
     private static let legacyPrivacyPendingKeyPrefix = "trackhub.privacy_pending."
+    private static let runtimeCircuitMarkerKey = "trackhub.runtime_circuit.last_run.v1"
     private static let iso8601 = ISO8601DateFormatter()
     private static let callbackTimeout: TimeInterval = 15
     private static let maxReportBytes = EventQueue.defaultMaxItemBytes
     private static let retryBaseInterval: TimeInterval = 1
     private static let retryMaxInterval: TimeInterval = 5 * 60
+    private static let runtimeCircuitLock = NSLock()
+    private static var runtimeCircuitOpen = false
+
+    private enum RuntimeCircuitReason: String {
+        case algorithm
+        case storage
+        case credentials
+    }
 
     // MARK: - Public API
 
@@ -184,6 +193,10 @@ public enum TrackHub {
     /// contains this app's endpoint and ingest credentials; it is never logged.
     @MainActor
     public static func start(_ configuration: TrackHubConfig) {
+        guard !isRuntimeCircuitOpen() else {
+            print("[TrackHub] runtime circuit is open — SDK remains disabled until app restart")
+            return
+        }
         if case .testLab = configuration.environment,
            configuration.environment.testToken == nil {
             print("[TrackHub] invalid Test Lab token — SDK not started")
@@ -289,6 +302,7 @@ public enum TrackHub {
             retryDeadline = nil
             transientRetryNotBefore = nil
             startATTConsentDelayIfNeeded()
+            reportRuntimeCircuitDiagnosticIfNeeded()
             publishApphudDeviceIdentifiers()
             if config?.integrationTestToken == nil {
                 SKANUpdater.registerForAttribution()
@@ -336,7 +350,7 @@ public enum TrackHub {
         _ deviceToken: String,
         environment: TrackHubPushEnvironment = .production
     ) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         let value = deviceToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.count >= 32, value.count <= 4096 else { return }
         UserDefaults.standard.set(value, forKey: pushTokenKey)
@@ -352,6 +366,10 @@ public enum TrackHub {
     public static func attribution(
         completion: @escaping (TrackHubAttribution?) -> Void
     ) {
+        guard !isRuntimeCircuitOpen() else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
         queue.async {
             if let currentAttributionSnapshot {
                 return DispatchQueue.main.async { completion(currentAttributionSnapshot) }
@@ -365,6 +383,10 @@ public enum TrackHub {
     public static func resolveDeferredDeepLink(
         completion: @escaping TrackHubDeferredDeepLinkHandler
     ) {
+        guard !isRuntimeCircuitOpen() else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
         queue.async { resolveDeferredDeepLinkIfNeeded(completion: completion) }
     }
 
@@ -438,7 +460,7 @@ public enum TrackHub {
     public static func requestAppTrackingTransparency(
         completion: ((TrackHubTrackingAuthorizationStatus) -> Void)? = nil
     ) {
-        guard !isPrivacyStopRequested() else {
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else {
             DispatchQueue.main.async { completion?(.unavailable) }
             return
         }
@@ -545,7 +567,7 @@ public enum TrackHub {
     /// Firebase — the host app passes the id in. Prefer setting it on
     /// `TrackHubConfig` before `start`; later updates re-report install context.
     public static func updateFirebaseAppInstanceId(_ appInstanceId: String) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         guard !appInstanceId.isEmpty else { return }
         UserDefaults.standard.set(appInstanceId, forKey: appInstanceIdKey)
     }
@@ -556,7 +578,7 @@ public enum TrackHub {
     /// `googleOnDeviceMeasurementInfo`) so the first_open request can carry
     /// `odm_info`; TrackHub caches it for later sessions and purchases.
     public static func updateGoogleOnDeviceMeasurementInfo(_ info: String) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         guard let value = boundedOdmInfo(info) else { return }
         UserDefaults.standard.set(value, forKey: odmInfoKey)
     }
@@ -566,7 +588,7 @@ public enum TrackHub {
     /// a language unrelated to their current country. A trusted server edge may
     /// override this value from its geo header.
     public static func updateCountryCode(_ countryCode: String) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         guard let value = normalizedCountryCode(countryCode) else { return }
         UserDefaults.standard.set(value, forKey: countryCodeKey)
     }
@@ -579,7 +601,7 @@ public enum TrackHub {
     /// update whenever consent changes. A post-start change re-reports only the
     /// install identity + latest consent; attribution stays first-write-wins.
     public static func updateGoogleAdsConsent(_ consent: TrackHubGoogleAdsConsent) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         persistGoogleAdsConsent(consent)
         queue.async { reportConsentUpdateIfInstalled() }
     }
@@ -588,7 +610,7 @@ public enum TrackHub {
     /// TrackHub fails closed for Google cross-border ads measurement once these
     /// signals are in use and transfer/measurement consent is not granted.
     public static func updatePIPLConsent(_ consent: TrackHubPIPLConsent) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         persistPIPLConsent(consent)
         queue.async { reportConsentUpdateIfInstalled() }
     }
@@ -618,7 +640,7 @@ public enum TrackHub {
     /// install-time values also ride the one-shot install report. `wbraid` is
     /// retained for the separate web/offline conversion contour.
     public static func setGoogleClickIds(gclid: String? = nil, gbraid: String? = nil, wbraid: String? = nil) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         storeGoogleClickIds(gclid: gclid, gbraid: gbraid, wbraid: wbraid)
         if gclid?.isEmpty == false || gbraid?.isEmpty == false {
             queue.async {
@@ -641,7 +663,7 @@ public enum TrackHub {
     /// Google `gclid`/`gbraid`/`wbraid` and OpenAI Ads `oppref`.
     @discardableResult
     public static func handleDeepLink(_ url: URL) -> Bool {
-        guard !isPrivacyStopRequested() else { return false }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return false }
         let ids = parseGoogleClickIds(from: url)
         let oppref = parseOpenAiOppref(from: url)
         guard ids.gclid != nil || ids.gbraid != nil || ids.wbraid != nil || oppref != nil else {
@@ -679,7 +701,7 @@ public enum TrackHub {
     /// convenience for `.reengagement` updates.
     @discardableResult
     public static func handleAdAttributionReengagement(_ url: URL) -> String? {
-        guard !isPrivacyStopRequested() else { return nil }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return nil }
         guard let tag = parseAdAttributionReengagementConversionTag(from: url) else { return nil }
         UserDefaults.standard.set(tag, forKey: adAttributionConversionTagKey)
         queue.async {
@@ -730,8 +752,9 @@ public enum TrackHub {
         adAttributionTarget: AdAttributionConversionTarget = .all,
         conversionTag: String? = nil
     ) {
-        guard !isPrivacyStopRequested() else { return }
+        guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         queue.async {
+            guard !isRuntimeCircuitOpen() else { return }
             refreshApphudIdentity()
             guard let config else { return log("trackEvent(\(name)) before start — skipped") }
             var body: [String: Any] = [
@@ -851,8 +874,11 @@ public enum TrackHub {
     /// store transaction id Apphud sends. Requires `sdkSecret` because the
     /// server rejects unsigned purchase contexts.
     public static func trackPurchaseObserved(transactionId: String, productId: String? = nil) {
-        guard !transactionId.isEmpty, !isPrivacyStopRequested() else { return }
+        guard !transactionId.isEmpty,
+              !isPrivacyStopRequested(),
+              !isRuntimeCircuitOpen() else { return }
         queue.async {
+            guard !isRuntimeCircuitOpen() else { return }
             refreshApphudIdentity()
             guard let config else { return log("trackPurchaseObserved before start — skipped") }
             guard config.sdkSecret?.isEmpty == false else {
@@ -919,6 +945,7 @@ public enum TrackHub {
         conversionTag: String? = nil
     ) {
         queue.async {
+            guard !isRuntimeCircuitOpen() else { return }
             guard config?.integrationTestToken == nil else {
                 return log("Apple conversion update suppressed in Integration Test Lab")
             }
@@ -964,6 +991,7 @@ public enum TrackHub {
 
     // On `queue`. Reports a new session if this foreground started one.
     private static func handleForeground(force: Bool = false) {
+        guard !isRuntimeCircuitOpen() else { return }
         refreshApphudIdentity()
         if trackingDisabled || isPrivacyStopRequested() {
             retryPendingErasure()
@@ -1016,6 +1044,7 @@ public enum TrackHub {
     // MARK: - Install
 
     private static func reportInstallIfNeeded() {
+        guard !isRuntimeCircuitOpen() else { return }
         guard let config else { return }
         let isIntegrationTest = config.integrationTestToken != nil
         let defaults = UserDefaults.standard
@@ -1077,6 +1106,7 @@ public enum TrackHub {
     }
 
     private static func reportPushTokenIfAvailable() {
+        guard !isRuntimeCircuitOpen() else { return }
         guard let config,
               config.integrationTestToken == nil,
               config.sdkSecret?.isEmpty == false,
@@ -1144,6 +1174,7 @@ public enum TrackHub {
     // MARK: - Schema
 
     private static func refreshSchema() {
+        guard !isRuntimeCircuitOpen() else { return }
         guard let config else { return }
         let url = config.endpoint.appendingPathComponent("ingest").appendingPathComponent(config.ingestToken).appendingPathComponent("cv-schema")
         var request = URLRequest(url: url)
@@ -1377,6 +1408,10 @@ public enum TrackHub {
         completion: ((TrackHubAttribution?) -> Void)? = nil
     ) {
         if let completion { attributionCompletions.append(completion) }
+        guard !isRuntimeCircuitOpen() else {
+            finishAttributionCompletions(nil)
+            return
+        }
         guard !trackingDisabled else {
             finishAttributionCompletions(nil)
             return
@@ -1869,7 +1904,9 @@ public enum TrackHub {
         dedupeKey: String? = nil,
         completion: ((Int?) -> Void)? = nil
     ) -> Bool {
-        guard !trackingDisabled, !isPrivacyStopRequested() else { return false }
+        guard !trackingDisabled,
+              !isPrivacyStopRequested(),
+              !isRuntimeCircuitOpen() else { return false }
         var payload = body
         if let testToken = config?.integrationTestToken { payload["test_run_token"] = testToken }
         guard JSONSerialization.isValidJSONObject(payload),
@@ -1894,6 +1931,9 @@ public enum TrackHub {
             dedupeKey: dedupeKey
         )
         guard let reportID = targetQueue.enqueue(report) else {
+            if targetQueue.storageFailure {
+                openRuntimeCircuit(.storage, detail: "offline queue persistence failed")
+            }
             log("\(path) could not be written to the offline queue — skipped")
             completion?(nil)
             return false
@@ -1912,7 +1952,7 @@ public enum TrackHub {
     // Drain exactly one report at a time; each is signed FRESH at send time so
     // a stale timestamp never rejects buffered traffic.
     private static func flush() {
-        guard !trackingDisabled else { return }
+        guard !trackingDisabled, !isRuntimeCircuitOpen() else { return }
         guard !attConsentDelayActive else { return }
         guard !deliveryInFlight else { return }
         guard let targetQueue = eventQueue else { return }
@@ -1960,6 +2000,7 @@ public enum TrackHub {
         status: Int?,
         responseData: Data?
     ) {
+        guard !isRuntimeCircuitOpen() else { return }
         guard targetQueue.items.contains(where: { $0.id == report.id }) else {
             deliveryCompletions.removeValue(forKey: report.id)
             return
@@ -1994,6 +2035,9 @@ public enum TrackHub {
                 nextAttemptAt: nextAttemptAt
             ) {
                 log("\(report.path) retry state could not be persisted")
+                if targetQueue.storageFailure {
+                    openRuntimeCircuit(.storage, detail: "offline retry state persistence failed")
+                }
             }
             log(correctedClock
                 ? "device clock corrected — retrying \(report.path)"
@@ -2008,10 +2052,14 @@ public enum TrackHub {
                 DispatchQueue.main.async { handler(failure) }
             }
             log("SDK credentials rejected after clock recovery — host notified")
+            openRuntimeCircuit(.credentials, detail: "SDK credentials rejected")
         }
 
         if !targetQueue.remove(id: report.id) {
             log("\(report.path) queue removal could not be persisted")
+            if targetQueue.storageFailure {
+                openRuntimeCircuit(.storage, detail: "offline delivery state persistence failed")
+            }
         }
         let completion = deliveryCompletions.removeValue(forKey: report.id)
         if isSuccess(status) {
@@ -2380,6 +2428,84 @@ public enum TrackHub {
             forKey: installCredentialBootstrapKey(token: config.ingestToken)
         )
         log("device-scoped install credential received")
+    }
+
+    /// A process-local fail-silent circuit. It is deliberately not persisted:
+    /// the next clean app launch retries the SDK from durable state. Privacy
+    /// erasure does not consult this flag and remains available even when the
+    /// measurement contour has stopped.
+    private static func isRuntimeCircuitOpen() -> Bool {
+        runtimeCircuitLock.lock()
+        let value = runtimeCircuitOpen
+        runtimeCircuitLock.unlock()
+        return value
+    }
+
+    private static func openRuntimeCircuit(_ reason: RuntimeCircuitReason, detail: String) {
+        runtimeCircuitLock.lock()
+        let firstOpen = !runtimeCircuitOpen
+        runtimeCircuitOpen = true
+        runtimeCircuitLock.unlock()
+        if firstOpen {
+            UserDefaults.standard.set([
+                "id": UUID().uuidString.lowercased(),
+                "reason": reason.rawValue,
+                "occurred_at": iso8601.string(from: Date()),
+            ], forKey: runtimeCircuitMarkerKey)
+            _ = UserDefaults.standard.synchronize()
+            log("runtime circuit opened (\(detail)) — measurement disabled until app restart")
+        }
+    }
+
+    /// Enqueues the previous process's marker only after a valid production
+    /// configuration and privacy gate. The UUID is also the durable queue
+    /// dedupe key, so a crash around marker removal cannot inflate Health.
+    private static func reportRuntimeCircuitDiagnosticIfNeeded() {
+        guard config?.integrationTestToken == nil,
+              let marker = UserDefaults.standard.dictionary(forKey: runtimeCircuitMarkerKey) else { return }
+        guard let id = marker["id"] as? String,
+              UUID(uuidString: id) != nil,
+              let reason = marker["reason"] as? String,
+              RuntimeCircuitReason(rawValue: reason) != nil,
+              let occurredAt = marker["occurred_at"] as? String,
+              ISO8601DateFormatter().date(from: occurredAt) != nil else {
+            UserDefaults.standard.removeObject(forKey: runtimeCircuitMarkerKey)
+            return
+        }
+        let accepted = send(
+            path: "sdk/diagnostic",
+            body: [
+                "id": id,
+                "sdk_source": "trackhub-ios",
+                "sdk_version": Self.sdkVersion,
+                "reason": reason,
+                "occurred_at": occurredAt,
+            ],
+            kind: "sdk_runtime_diagnostic",
+            dedupeKey: "sdk_runtime:\(id)"
+        )
+        if accepted {
+            UserDefaults.standard.removeObject(forKey: runtimeCircuitMarkerKey)
+        }
+    }
+
+    @_spi(Testing) public static func runtimeCircuitOpenForTesting() -> Bool {
+        isRuntimeCircuitOpen()
+    }
+
+    @_spi(Testing) public static func openRuntimeCircuitForTesting() {
+        openRuntimeCircuit(.algorithm, detail: "test")
+    }
+
+    @_spi(Testing) public static func runtimeCircuitMarkerReasonForTesting() -> String? {
+        UserDefaults.standard.dictionary(forKey: runtimeCircuitMarkerKey)?["reason"] as? String
+    }
+
+    @_spi(Testing) public static func resetRuntimeCircuitForTesting() {
+        runtimeCircuitLock.lock()
+        runtimeCircuitOpen = false
+        runtimeCircuitLock.unlock()
+        UserDefaults.standard.removeObject(forKey: runtimeCircuitMarkerKey)
     }
 
     static func log(_ message: String) {

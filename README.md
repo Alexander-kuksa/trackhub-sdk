@@ -21,7 +21,7 @@ Add this package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select version `2.0.5` or a compatible `2.x` range.
+Select version `2.0.6` or a compatible `2.x` range.
 
 ## Start
 
@@ -182,6 +182,17 @@ Test Lab has an isolated queue namespace and never drains production events.
 - queue limits: 1,000 reports, 4 MiB total, 64 KiB per report;
 - install reports have eviction priority;
 - no TrackHub token/secret is logged or persisted in the measurement queue.
+
+SDK `2.0.6` also has a process-local fail-silent circuit. A detected durable
+storage failure or unrecoverable credential rejection stops measurement for
+the rest of the current process, preserves the existing disk queue and retries
+from clean state on the next app launch. That launch also sends one signed,
+idempotent and privacy-minimal Health marker. Device privacy erasure remains active.
+
+This is containment, not an impossible crash guarantee: Swift runtime traps,
+Objective-C exceptions, OOM, stack overflow and binary/linker failures cannot
+be safely intercepted by an in-process iOS library. Host callbacks must also
+accept documented optional values instead of force-unwrapping them.
 
 ## Building and checks
 

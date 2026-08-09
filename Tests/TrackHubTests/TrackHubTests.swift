@@ -112,6 +112,23 @@ final class TrackHubTests: XCTestCase {
         XCTAssertTrue(quarantined)
     }
 
+    func testUnwritableQueueSignalsStorageFailureWithoutThrowing() {
+        let queue = EventQueue(url: URL(fileURLWithPath: "/dev/null/trackhub-queue.json"))
+        XCTAssertNil(queue.enqueue(PendingReport(path: "sdk/track", body: Data("{}".utf8))))
+        XCTAssertTrue(queue.storageFailure)
+    }
+
+    func testRuntimeCircuitIsProcessLocalAndResettableForTests() {
+        TrackHub.resetRuntimeCircuitForTesting()
+        XCTAssertFalse(TrackHub.runtimeCircuitOpenForTesting())
+        TrackHub.openRuntimeCircuitForTesting()
+        XCTAssertTrue(TrackHub.runtimeCircuitOpenForTesting())
+        XCTAssertEqual(TrackHub.runtimeCircuitMarkerReasonForTesting(), "algorithm")
+        TrackHub.resetRuntimeCircuitForTesting()
+        XCTAssertFalse(TrackHub.runtimeCircuitOpenForTesting())
+        XCTAssertNil(TrackHub.runtimeCircuitMarkerReasonForTesting())
+    }
+
     func testPrivacyRequestBeforeStartIsDurable() {
         let defaults = UserDefaults.standard
         let disabledKey = "trackhub.privacy_disabled.v2"
@@ -127,12 +144,14 @@ final class TrackHubTests: XCTestCase {
             .appendingPathComponent("trackhub_privacy_v2.json")
         try? FileManager.default.removeItem(at: file)
         defer {
+            TrackHub.resetRuntimeCircuitForTesting()
             defaults.removeObject(forKey: disabledKey)
             defaults.removeObject(forKey: pendingKey)
             defaults.removeObject(forKey: installKey)
             try? FileManager.default.removeItem(at: file)
         }
 
+        TrackHub.openRuntimeCircuitForTesting()
         TrackHub.gdprForgetMe()
         XCTAssertTrue(defaults.bool(forKey: disabledKey))
         XCTAssertTrue(

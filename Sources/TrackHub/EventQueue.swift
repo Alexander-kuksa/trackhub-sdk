@@ -64,6 +64,11 @@ import Foundation
     private let maxItemBytes: Int
     private let url: URL
     private var storageNeedsReload: Bool
+    /// Set only when the latest durable mutation failed. Capacity eviction and
+    /// payload rejection are expected bounded-buffer outcomes, not storage
+    /// failures. TrackHub uses this distinction to open its fail-silent circuit
+    /// instead of repeatedly touching unhealthy storage.
+    public private(set) var storageFailure: Bool
     public private(set) var items: [PendingReport]
 
     public init(
@@ -77,6 +82,7 @@ import Foundation
         self.maxItemBytes = max(1, min(maxItemBytes, maxBytes))
         self.url = url
         self.storageNeedsReload = false
+        self.storageFailure = false
         self.items = []
 
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
@@ -263,7 +269,10 @@ import Foundation
 
     @discardableResult
     private func persist() -> Bool {
-        guard let data = try? JSONEncoder().encode(items), data.count <= maxBytes else { return false }
+        guard let data = try? JSONEncoder().encode(items), data.count <= maxBytes else {
+            storageFailure = true
+            return false
+        }
         do {
             try FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(),
@@ -279,8 +288,10 @@ import Foundation
                 ofItemAtPath: url.path
             )
             #endif
+            storageFailure = false
             return true
         } catch {
+            storageFailure = true
             return false
         }
     }

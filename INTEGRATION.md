@@ -94,6 +94,15 @@ A stale signature returns server time; the SDK validates a 2020–2100 timestamp
 keeps the item, re-signs with process-local offset and retries. It never changes
 the device clock.
 
+Detected queue-storage failure or final credential rejection opens a
+process-local runtime circuit: measurement becomes a no-op until the next app
+launch, the already-durable queue is retained, and `gdprForgetMe` remains
+available. The next valid production launch sends one signed, idempotent Health
+marker with no user/device/exception data. This circuit cannot catch
+Swift/Objective-C runtime traps, OOM,
+stack overflow or binary-loading failures; no in-process iOS SDK can make that
+guarantee. Treat optional attribution/deep-link callback values as optional.
+
 ## Apphud ownership
 
 TrackHub depends on ApphudSDK but never calls `Apphud.start`. It uses:

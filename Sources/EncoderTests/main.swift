@@ -360,6 +360,10 @@ check(
     persistedTrackCount >= 25,
     "an unavailable TrackHub server cannot prevent events reaching durable storage"
 )
+check(
+    !TrackHub.runtimeCircuitOpenForTesting(),
+    "an unavailable TrackHub server does not open the runtime circuit"
+)
 try? FileManager.default.removeItem(at: outageURL)
 
 let productionQueue = TrackHub.offlineQueueNamespace(for: nil)

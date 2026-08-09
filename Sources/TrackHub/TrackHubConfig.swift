@@ -125,12 +125,13 @@ struct DecodedTrackHubSdkKey: Decodable, Equatable {
         let trackingEndpointString = try values.decodeIfPresent(String.self, forKey: .trackingEndpoint)
         let ingestToken = try values.decode(String.self, forKey: .ingestToken)
         let sdkSecret = try values.decode(String.self, forKey: .sdkSecret)
+        let decodedTrackingEndpoint = trackingEndpointString.flatMap(Self.validEndpoint)
         guard let endpoint = Self.validEndpoint(endpointString),
-              trackingEndpointString == nil || Self.validEndpoint(trackingEndpointString!) != nil,
+              trackingEndpointString == nil || decodedTrackingEndpoint != nil,
               ingestToken.count >= 20, sdkSecret.count >= 20 else {
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "invalid sdkKey"))
         }
-        let trackingEndpoint = trackingEndpointString.flatMap(Self.validEndpoint)
+        let trackingEndpoint = decodedTrackingEndpoint
         if let trackingEndpoint,
            endpoint.host?.lowercased() == trackingEndpoint.host?.lowercased() {
             throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "measurement and tracking hosts must differ"))
