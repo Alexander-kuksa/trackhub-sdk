@@ -76,7 +76,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "2.0.6"
+    public static let sdkVersion = "2.0.7"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?

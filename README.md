@@ -21,7 +21,7 @@ Add this package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select version `2.0.6` or a compatible `2.x` range.
+Select version `2.0.7` or a compatible `2.x` range.
 
 ## Start
 
@@ -183,7 +183,7 @@ Test Lab has an isolated queue namespace and never drains production events.
 - install reports have eviction priority;
 - no TrackHub token/secret is logged or persisted in the measurement queue.
 
-SDK `2.0.6` also has a process-local fail-silent circuit. A detected durable
+SDK `2.0.7` also has a process-local fail-silent circuit. A detected durable
 storage failure or unrecoverable credential rejection stops measurement for
 the rest of the current process, preserves the existing disk queue and retries
 from clean state on the next app launch. That launch also sends one signed,
