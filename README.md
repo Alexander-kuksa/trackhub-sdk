@@ -80,12 +80,19 @@ TrackHub.trackOnboardingShown()
 TrackHub.trackPaywallShown(at: .onboarding)
 TrackHub.trackPurchaseCtaTapped(at: .onboarding)
 TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
+TrackHub.trackEvent("tutorial_done", deduplicationId: "tutorial-v1")
 TrackHub.handleDeepLink(url)
 TrackHub.requestAppTrackingTransparency()
 ```
 
 Paywall placement is sent as the `placement_name` parameter. Do not encode it
 in the event name. Do not mirror billing lifecycle or money as client events.
+Use the optional `deduplicationId` only when the host may retry the same logical
+event. It is trimmed, limited to 256 UTF-8 bytes, and scoped to the current
+installation plus event name, so another device cannot suppress its event.
+Without it, every call remains a distinct event. Server deduplication lasts for
+the measurement-event retention window: 90 days by default, account-configured,
+or indefinite when retention is `0`.
 
 ```swift
 TrackHub.updateGoogleAdsConsent(newGoogleConsent)
@@ -116,6 +123,11 @@ consent prompt.
 `TrackHub.gdprForgetMe()` stops local measurement immediately, clears queued
 measurement and persists a crash-safe device-erasure task. It still works while
 the runtime safety circuit is open.
+
+Before any report can use `install_uid`, iOS atomically writes it to a
+backup-excluded protected file and mirrors it to `UserDefaults` for SDK 3.0.x
+upgrade compatibility. A storage failure opens the process-local safety circuit
+and no measurement is sent with a non-durable identity.
 
 Reports are atomically stored before delivery. Transport failures, 408, 429 and
 5xx retry with jitter; ordinary 4xx rejects only that report. The bounded queue

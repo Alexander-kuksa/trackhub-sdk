@@ -144,6 +144,15 @@ let sigHex = sigMac.map { String(format: "%02x", $0) }.joined()
 check(sigHex == "48bd3ea5529853b246d18a578d1ce79aa50c2d3e7f69663b233bd696c5c8a91d",
       "SDK signature HMAC matches the server vector")
 
+check(
+    TrackHub.deduplicatedClientEventId(
+        installUid: "11111111-2222-4333-8444-555555555555",
+        eventName: "tutorial_done",
+        deduplicationId: "order-42"
+    ) == "dedup1-9068017e11119b7a3c99163c1cb825e87ecda0542a4405cb526d506b941eb579",
+    "install-scoped event deduplication matches the shared SHA-256 vector"
+)
+
 let installCredential = "thic_v1_" + String(repeating: "A", count: 43)
 check(
     InstallCredentialStore.isValid(installCredential),

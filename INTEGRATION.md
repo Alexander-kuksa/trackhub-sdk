@@ -6,6 +6,14 @@ SDK 3 is provider-neutral. `install_uid` is the private measurement identity for
 one installation and is sent as `user_id`. It is regenerated after uninstall /
 reinstall. TrackHub deliberately does not build an IDFV device graph.
 
+Version 3.0.3 persists `install_uid` to an atomic, backup-excluded protected file
+before it can enter a report; `UserDefaults` is only an upgrade-compatibility
+mirror. A 3.0.0–3.0.3 value migrates even when the offline queue is empty, so an
+ordinary SDK update cannot create a phantom installation. iCloud restore and a
+same-device SDK update are not reliably distinguishable from that legacy mirror;
+3.0.3 intentionally preserves the previous restore behavior rather than risking
+a new identity on every update.
+
 External billing identities are optional provider-scoped links:
 
 ```swift
@@ -81,6 +89,32 @@ missing EEA consent, the independent server default supplies the effective
 
 The SDK creates a new session after more than 30 minutes in background. A deep
 link can force a re-engagement session immediately.
+
+## Optional engagement-event deduplication
+
+When application code can retry one logical event, pass a stable business key:
+
+```swift
+TrackHub.trackEvent("tutorial_done", deduplicationId: "tutorial-v1")
+```
+
+Blank values behave as absent; nonblank values over 256 UTF-8 bytes skip the
+event. The SDK derives the wire ID as
+`dedup1-` + lowercase SHA-256 of
+`install_uid + NUL + event_name + NUL + trimmed_deduplication_id`. This makes
+deduplication installation-scoped; the same key on another installation remains
+a separate event. Calls without the parameter keep random IDs and are distinct.
+The shared cross-platform fixture is:
+
+```text
+install_uid: 11111111-2222-4333-8444-555555555555
+event_name: tutorial_done
+deduplication_id: order-42
+client_event_id: dedup1-9068017e11119b7a3c99163c1cb825e87ecda0542a4405cb526d506b941eb579
+```
+
+Deduplication lasts for the measurement-event retention window: 90 days by
+default, configurable at account level, and indefinite when retention is `0`.
 
 ## Billing and attribution rules
 
