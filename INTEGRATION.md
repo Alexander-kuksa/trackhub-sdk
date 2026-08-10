@@ -32,6 +32,32 @@ network request; Test Lab remains independent. Version 3.0.1 also repairs a
 persisted 3.0.0 queue by delivering a later install ahead of a blocked identity.
 No Apphud or RevenueCat code is compiled into TrackHub.
 
+## First-party measurement geography (3.0.2)
+
+The production `/install` acknowledgement includes `geo_ack_version: 1` on a
+compatible server and may include ISO-3166 `country` and protective `eea`
+fields resolved by Daively's trusted edge. The SDK validates them, scopes them
+to the current `install_uid`, and durably caches them for later install,
+session, event, consent and purchase-context payloads. The cache is a device
+signal only: the server resolves trusted-edge geography again before consent or
+external-delivery decisions.
+
+`countryCode` remains an optional initial host fallback. A later server country
+may replace it. EEA is monotonic-protective: host `true` OR cached `true` stays
+true; cached false cannot narrow host true. No Locale, GPS or IP-based SDK
+geolocation is performed, and no IP is persisted or added to a payload.
+
+An app upgraded from 3.0.1 with an existing install credential schedules one
+durable, idempotent `/install` context refresh when its server-geo cache is
+missing. A `2xx` without `geo_ack_version: 1` is treated as an old server and
+retried with backoff. The refresh retires after 12 retryable/old-contract
+responses and fails silently. A v1 ACK with no `country` or `eea` is a valid
+terminal answer: geography is genuinely unknown.
+
+Release gate: publish/tag 3.0.2 only after the platform contract, tests and
+production deployment are verified. The versioned ACK makes either rollout
+order fail-safe, but server-first avoids unnecessary bounded retries.
+
 ## Public methods
 
 | Method | Purpose |

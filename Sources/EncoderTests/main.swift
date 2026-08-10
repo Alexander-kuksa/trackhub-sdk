@@ -485,6 +485,31 @@ check(purchaseBody["first_open_at"] as? String == "2026-05-17T06:40:00Z",
 check(purchaseBody["revenue_cents"] == nil && purchaseBody["currency"] == nil,
       "purchase context never carries client-authored revenue")
 
+let measurementDefaults = UserDefaults.standard
+let measurementInstallUid = purchaseBody["install_uid"] as! String
+measurementDefaults.set("US", forKey: "trackhub.country_code")
+measurementDefaults.set(true, forKey: "trackhub.consent.eea")
+measurementDefaults.set("DE", forKey: "trackhub.measurement_geo.country.v1")
+measurementDefaults.set(false, forKey: "trackhub.measurement_geo.eea.v1")
+measurementDefaults.set(measurementInstallUid, forKey: "trackhub.measurement_geo.install_uid.v1")
+let geoPurchaseBody = TrackHub.purchaseContextBody(
+    transactionId: "2000000123456790",
+    productId: nil
+)
+check(geoPurchaseBody["country"] as? String == "DE",
+      "server-resolved country replaces the explicit host fallback in later payloads")
+check(geoPurchaseBody["eea"] as? Bool == true,
+      "cached non-EEA cannot narrow an explicit protective EEA signal")
+for key in [
+    "trackhub.country_code",
+    "trackhub.consent.eea",
+    "trackhub.measurement_geo.country.v1",
+    "trackhub.measurement_geo.eea.v1",
+    "trackhub.measurement_geo.install_uid.v1",
+] {
+    measurementDefaults.removeObject(forKey: key)
+}
+
 // ── Canonical sales funnel: stable names + placement parameter ───────────────
 check(
     TrackHubSalesPlacement.allCases.map(\.rawValue) == [
