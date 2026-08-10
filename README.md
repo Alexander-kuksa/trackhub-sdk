@@ -4,9 +4,10 @@ TrackHub measures app installations, 30-minute foreground sessions, engagement,
 SKAdNetwork/AdAttributionKit values and short-lived purchase context. It has no
 dependency on Apphud, RevenueCat or another billing SDK.
 
-Current release: `3.0.1`. Requirements: iOS 15+, Swift Package Manager, and a
-TrackHub SDK Key copied from Daively → App → Setup. No application backend or
-login system is required.
+Current public release: `3.0.1`. The next patch is `3.0.2`; it remains
+unpublished until the matching Daively `/install` geography contract is live.
+Requirements: iOS 15+, Swift Package Manager, and a TrackHub SDK Key copied
+from Daively → App → Setup. No application backend or login system is required.
 
 ## Install and start
 
@@ -93,8 +94,15 @@ TrackHub.updateCountryCode("US")
 ```
 
 Country is optional and must be actual measurement geography, not device
-language. TrackHub does not read it from Apphud. A trusted Daively edge country
-overrides this fallback. Unknown consent remains unknown, never granted.
+language. From 3.0.2, the first successful production install response supplies
+server-resolved `country` / `eea` when the trusted edge can determine them. The
+SDK validates and durably caches that first-party result for later payloads.
+`countryCode` remains only an initial host fallback; the server result may
+replace it. An explicit host EEA signal and the cached signal are merged
+protectively: either `true` keeps traffic in EEA handling. TrackHub never uses
+Locale or GPS to infer geography and never discovers, stores or sends an IP
+address. The server re-evaluates every request and remains authoritative.
+Unknown consent remains unknown, never granted.
 
 ## Privacy and failure behavior
 
