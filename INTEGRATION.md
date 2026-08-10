@@ -1,173 +1,90 @@
-# TrackHub iOS 2.0 integration reference
+# TrackHub iOS 3.0 integration reference
 
-## Public startup surface
+## Contract
 
-```swift
-public struct TrackHubConfig {
-    public let sdkKey: String
-    public let environment: TrackHubEnvironment
-    public var debugLogging: Bool
-    public var countryCode: String?
-    public var attConsentWaitingInterval: TimeInterval
-    public var googleAdsConsent: TrackHubGoogleAdsConsent
-    public var piplConsent: TrackHubPIPLConsent
-    public var firebaseAppInstanceId: String?
-    public var googleOnDeviceMeasurementInfo: String?
-    public var attributionChangedHandler: TrackHubAttributionChangedHandler?
-    public var deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
-}
-```
+SDK 3 is provider-neutral. `install_uid` is the private measurement identity for
+one installation and is sent as `user_id`. It is regenerated after uninstall /
+reinstall. TrackHub deliberately does not build an IDFV device graph.
 
-Standard production integration needs only `sdkKey`; all other fields are
-explicit product/privacy choices. The removed 1.x `configure(...)`, manual
-`userId`, Apphud adapters and backend providers have no 2.0 aliases.
-
-## Recommended application flow
+External billing identities are optional provider-scoped links:
 
 ```swift
-import ApphudSDK
-import TrackHub
+var config = TrackHubConfig(sdkKey: "<TRACKHUB_SDK_KEY>")
+config.attConsentWaitingInterval = 120
+TrackHub.start(config)
+TrackHub.requestAppTrackingTransparency()
 
-func applicationDidStart() {
-    Apphud.start(apiKey: apphudKey)
-
-    var trackHub = TrackHubConfig(sdkKey: trackHubSdkKey)
-    trackHub.googleAdsConsent = googleConsent
-    trackHub.piplConsent = piplConsent
-    trackHub.countryCode = trustedCountryFallback
-    trackHub.attributionChangedHandler = { snapshot in
-        // Optional: update host UI. Apphud delivery already happened.
-    }
-    TrackHub.start(trackHub)
-}
+TrackHub.trackPaywallShown(at: .onboarding)
+TrackHub.trackPurchaseCtaTapped(at: .onboarding)
+// placement is encoded as the canonical placement_name parameter.
 ```
 
-`TrackHub.start` is `@MainActor`: call it from the normal application-launch
-callback, as above. It captures Apphud's current ID before returning, while all
-disk and network work continues on TrackHub's private queues.
+```swift
+TrackHub.setExternalIdentity(provider: "apphud", userId: Apphud.userID())
+TrackHub.setExternalIdentity(provider: "revenuecat", userId: Purchases.shared.appUserID)
+TrackHub.setExternalIdentity(provider: "custom:billing", userId: currentBillingID)
+```
 
-Call Apphud first. If Apphud registration finishes later, TrackHub observes the
-new user ID on foreground/event and sends a signed identity update. A restore or
-login therefore changes the binding without creating a second installation.
+Call after provider initialization and again when its ID changes. `nil` logs out
+only that provider. The call is non-blocking, durable and safe before the install
+report is acknowledged: the server returns retryable `503` until the installation
+exists. No Apphud or RevenueCat code is compiled into TrackHub.
 
 ## Public methods
 
 | Method | Purpose |
 |---|---|
-| `start(_:)` | Start SDK state and automatic lifecycle measurement |
-| `trackEvent` | Non-financial custom/engagement event |
-| `trackOnboardingShown` | Canonical onboarding impression |
-| `trackPaywallShown(at:)` | Canonical paywall impression with placement |
-| `trackPurchaseCtaTapped(at:)` | Canonical CTA tap with placement |
-| `trackPurchaseObserved` | Short-lived StoreKit transaction/device context; no money |
-| `handleDeepLink` | Capture bounded ad references, leave routing to host |
-| `setGoogleClickIds` | Explicit Google reference handoff for wrappers |
-| `setPushToken` | Forward APNs token; TrackHub never requests permission |
-| `attribution` | Read durable device-scoped attribution snapshot |
-| `resolveDeferredDeepLink` | Reserved API; returns `nil` on iOS until a deterministic handoff exists |
+| `start(_:)` | Start automatic install/session measurement |
+| `setExternalIdentity(provider:userId:)` | Bind or clear an optional billing identity |
+| `trackEvent` and typed sales helpers | Non-financial engagement events |
+| `trackPurchaseObserved` | Transaction ID plus short-lived device context; no money |
+| `handleDeepLink` / `setGoogleClickIds` | Capture bounded ad references |
+| `setPushToken` | Forward a host-owned APNs token |
+| `attribution` | Read the installation attribution snapshot |
 | `requestAppTrackingTransparency` | Host-triggered ATT prompt |
-| `updateGoogleAdsConsent` | Change Google consent after startup |
-| `updatePIPLConsent` | Change PIPL consent after startup |
-| `updateCountryCode` | Change explicit country fallback |
-| `gdprForgetMe` | Immediate local stop plus durable device erasure |
+| `updateGoogleAdsConsent` / `updatePIPLConsent` | Change consent after startup |
+| `updateCountryCode` | Change a trusted country fallback |
+| `gdprForgetMe` | Immediate stop plus durable installation erasure |
 
-The typed paywall/CTA helpers always send the canonical placement in the
-`placement_name` parameter. Do not create event-name suffixes per screen.
+The SDK creates a new session after more than 30 minutes in background. A deep
+link can force a re-engagement session immediately.
 
-## Queue and delivery contract
+## Billing and attribution rules
 
-Every measurement report is serialized and written before its network request.
-The queue lives in `Application Support/TrackHub`, is excluded from backup and
-uses atomic replacement. The SDK migrates the former Caches queue once. Corrupt
-files are moved to a `.corrupt-*` quarantine.
+- Apphud/S2S may be the economic source of truth without Apple credentials.
+- Apple verification, ASSN and reconciliation are optional trust upgrades.
+- Explicit `FAMILY_SHARED` access never books money, trials or paid conversions.
+- Apphud payloads that omit ownership remain compatible and visible as
+  `ownership unknown`, but do not create a permanent Apple family anchor.
+- The acquisition transaction anchors all renewals in its transaction family.
+  Current device activity never chooses the owner.
+- A late purchase context repairs Daively attribution internally. A conversion
+  already deduplicated by Google is not resent; Health reports this asymmetry.
 
-Limits:
+Attribution back into a billing SDK is host-owned:
 
-- 1,000 queued items;
-- 4 MiB queue;
-- 64 KiB item;
-- one delivery in flight;
-- retry base 1 second, full jitter, 5-minute cap.
+```swift
+TrackHub.attribution { snapshot in
+    // Optional: translate snapshot with the provider's documented API.
+}
+```
 
-Transport failure, 408, 429 and 5xx retry. Other 4xx are terminal for the item.
-A stale signature returns server time; the SDK validates a 2020–2100 timestamp,
-keeps the item, re-signs with process-local offset and retries. It never changes
-the device clock.
+## Release checklist
 
-Detected queue-storage failure or final credential rejection opens a
-process-local runtime circuit: measurement becomes a no-op until the next app
-launch, the already-durable queue is retained, and `gdprForgetMe` remains
-available. The next valid production launch sends one signed, idempotent Health
-marker with no user/device/exception data. This circuit cannot catch
-Swift/Objective-C runtime traps, OOM,
-stack overflow or binary-loading failures; no in-process iOS SDK can make that
-guarantee. Treat optional attribution/deep-link callback values as optional.
+1. Resolve TrackHub 3.x and confirm the dependency graph contains no Apphud or RevenueCat through TrackHub.
+2. Start TrackHub with one SDK Key and link the chosen provider with one explicit call.
+3. Run a clean Test Lab installation; verify install precedes the first session.
+4. Verify foreground at 29:59 stays in-session and 30:01 starts a new session.
+5. Exercise provider anonymous ID, login ID, logout, and restore without changing `install_uid`.
+6. Complete an Apphud/RevenueCat sandbox purchase and verify the authenticated server event.
+7. If Apple verification is enabled, verify the reconciliation seed confirms; otherwise verify lower-trust money remains visible.
+8. Test offline queue, process restart, and exactly-once drain.
+9. Test `gdprForgetMe` offline and after relaunch.
+10. Confirm SDK Key, install credential and raw external identity are absent from logs/crash metadata.
 
-## Apphud ownership
+## Upgrade from 2.x
 
-TrackHub depends on ApphudSDK but never calls `Apphud.start`. It uses:
-
-- `Apphud.userID()` for the current external identity;
-- `Apphud.setDeviceIdentifiers` for consent-permitted device identifiers;
-- `Apphud.setAttribution(... from: .custom ...)` for TrackHub attribution.
-
-It never passes the TrackHub install credential to Apphud. Revenue is consumed
-only from Apphud webhook/S2S on the TrackHub server.
-
-## SKAN and AdAttributionKit
-
-The SDK fetches the server conversion schema, applies monotonic fine/coarse/lock
-updates and isolates install vs re-engagement windows. Signed responses may
-carry a server-recalculated conversion instruction based on Apphud/S2S history.
-Do not mirror server lifecycle events to force a conversion value.
-
-For AdAttributionKit copies configure the documented `.well-known` endpoint and
-Info.plist keys in the host application. These server-copy settings are separate
-from `TrackHub.start`.
-
-## Privacy durability
-
-`gdprForgetMe` persists a small atomic job under Application Support before
-network delivery, stops public tracking, clears all measurement identifiers and
-retains only `install_uid` plus the private credential needed for erasure.
-The privacy state is installation-scoped rather than SDK-Key-scoped, so it is
-durable before `start` and cannot be reset by credential rotation.
-
-Direct credential failure falls back to endpoint-bound HMAC recovery. One clock
-correction is allowed per attempt; persistent auth failure backs off and remains
-stopped. On server confirmation, the credential and `install_uid` are deleted
-last and the durable local disabled state remains.
-
-## Release verification
-
-1. Build the app with iOS 15 deployment target.
-2. Confirm exactly one ApphudSDK version is resolved.
-3. Run a clean isolated Test Lab install.
-4. Verify install precedes session in the timeline.
-5. Trigger a paywall and custom event.
-6. Complete an Apphud sandbox purchase. No purchase callback adapter is needed:
-   verify that the authenticated Apphud webhook reaches Daively and that the
-   server-side Apple reconciliation seed becomes confirmed.
-7. Turn network off, enqueue events, terminate, relaunch, restore network and
-   verify the queue drains once.
-8. Turn network off, call `gdprForgetMe`, terminate, relaunch online and verify
-   erasure completes without any new session/event.
-9. Confirm SDK Key and per-install token are absent from logs/crash reports.
-
-## Upgrade from 1.x
-
-This is a clean API break. Delete the old startup call and every host callback.
-Replace all startup values with one SDK Key. Rename:
-
-- `getAttribution` → `attribution`;
-- `forgetDevice` → `gdprForgetMe`;
-- consent/country setters → `update...` methods.
-
-Do not keep two TrackHub startup paths in one binary.
-
-### SKAN lock-window limitation
-
-When Apple supplies no coarse conversion value, the SDK does not manufacture
-`.low` merely to call the richer `updatePostbackConversionValue` overload.
-Consequently `lockWindow` cannot be expressed on that absent-coarse path. This
-is a deliberate fail-closed trade-off; AAK delivery remains unaffected.
+This is an intentional clean break made before commercial integrations. Remove
+any assumption that TrackHub starts after Apphud or reads it automatically. Add
+the explicit `setExternalIdentity` line only when a provider link is wanted.
+There is no dual 2.x/3.x server intake for native SDK reports.

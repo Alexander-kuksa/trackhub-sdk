@@ -5,18 +5,16 @@ let package = Package(
     name: "TrackHubSDK",
     platforms: [
         .iOS(.v15),
-        .macOS(.v13), // Apphud 4.4.x minimums; tests run on macOS
+        .macOS(.v13), // parity tests run on macOS
     ],
     products: [
         .library(name: "TrackHub", targets: ["TrackHub"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/apphud/ApphudSDK", exact: "4.4.8"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "TrackHub",
-            dependencies: [.product(name: "ApphudSDK", package: "ApphudSDK")],
+            dependencies: [],
             path: "Sources/TrackHub",
             // ship the privacy manifest so embedding apps inherit no undeclared
             // data-use / required-reason-API obligations

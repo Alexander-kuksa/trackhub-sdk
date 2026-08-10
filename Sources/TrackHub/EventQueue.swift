@@ -222,9 +222,12 @@ import Foundation
     }
 
     private func evictionIndex() -> Int {
-        // Do not let normal analytics traffic evict the one-shot install; it is
-        // the identity anchor for all subsequent conversions.
-        items.firstIndex { $0.kind != "production_install" } ?? 0
+        // Install and transaction context are one-shot attribution anchors.
+        // Evict normal analytics first; protected anchors still remain bounded
+        // when the queue contains nothing else.
+        items.firstIndex {
+            $0.kind != "production_install" && $0.kind != "transaction_context"
+        } ?? 0
     }
 
     private func reloadStorageIfNeeded() -> Bool {

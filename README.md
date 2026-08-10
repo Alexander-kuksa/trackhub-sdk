@@ -1,200 +1,116 @@
-# TrackHub iOS SDK 2.0
+# TrackHub iOS SDK 3.0
 
-TrackHub measures installs, sessions and engagement, applies SKAdNetwork /
-AdAttributionKit conversion values, and automatically bridges attribution to
-Apphud. Apphud remains authoritative for subscriptions and revenue.
+TrackHub measures app installations, 30-minute foreground sessions, engagement,
+SKAdNetwork/AdAttributionKit values and short-lived purchase context. It has no
+dependency on Apphud, RevenueCat or another billing SDK.
 
-## Requirements
+Current release: `3.0.0`. Requirements: iOS 15+, Swift Package Manager, and a
+TrackHub SDK Key copied from Daively → App → Setup. No application backend or
+login system is required.
 
-- iOS 15+
-- Swift Package Manager
-- ApphudSDK 4.4.8 (included as a package dependency)
-- a TrackHub SDK Key copied from TrackHub → App → Setup
+## Install and start
 
-No application backend or login system is required.
-
-## Install
-
-Add this package in Xcode:
-
-```text
-https://github.com/Alexander-kuksa/trackhub-sdk
-```
-
-Select version `2.0.7` or a compatible `2.x` range.
-
-## Start
-
-Start Apphud first, then TrackHub:
+Add `https://github.com/Alexander-kuksa/trackhub-sdk` in Xcode and select
+`3.0.0` or a compatible `3.x` range.
 
 ```swift
-import ApphudSDK
 import TrackHub
 
-Apphud.start(apiKey: "<APPHUD_API_KEY>")
-
 var config = TrackHubConfig(sdkKey: "<TRACKHUB_SDK_KEY>")
-config.deliveryFailureHandler = { failure in
-    // Surface a diagnostic and release an app build with the current SDK Key.
-    print("TrackHub delivery configuration requires attention: \(failure)")
-}
-config.countryCode = "DE" // actual measurement country, not UI language
-config.googleAdsConsent = TrackHubGoogleAdsConsent(
-    adUserData: .granted,
-    adPersonalization: .denied,
-    isEea: true
-)
+config.googleAdsConsent = currentGoogleConsent
+config.countryCode = trustedCountryIfKnown
 config.attConsentWaitingInterval = 120
 TrackHub.start(config)
 ```
 
-`TrackHub.start` is main-actor isolated. The launch callback above already runs
-on the main actor; storage and network delivery remain asynchronous.
+`start` is main-actor isolated. Disk and network work remains asynchronous. The
+SDK Key is a credential: never log it or put it in URLs, analytics or crash data.
 
-The SDK Key is one versioned configuration value (`thcfg_v1_...`). Never put it
-in logs, URLs, analytics properties or support screenshots.
+## Optional billing identity
 
-TrackHub reads `Apphud.userID()` automatically. Do not build a user-ID adapter
-or proxy these SDK operations through an app backend.
+TrackHub owns no billing imports. The host may link any provider after both SDKs
+have started, and repeat the call after provider login/logout/restore:
 
-## Events
+```swift
+// Apphud 3.x, 4.x, or a later compatible host API:
+TrackHub.setExternalIdentity(provider: "apphud", userId: Apphud.userID())
+
+// RevenueCat:
+TrackHub.setExternalIdentity(provider: "revenuecat", userId: Purchases.shared.appUserID)
+
+// Provider logout:
+TrackHub.setExternalIdentity(provider: "apphud", userId: nil)
+```
+
+Supported namespaces are `apphud`, `revenuecat`, and `custom:<slug>`. Providers
+are independent. Linking one never renames the TrackHub installation and never
+clears another provider. TrackHub therefore works without a billing SDK and is
+not tied to any Apphud version.
+
+If the host wants attribution visible inside Apphud/RevenueCat, it should use
+`TrackHub.attribution` and the billing provider's own public API. TrackHub does
+not call another SDK on the application's behalf.
+
+## Purchases and verification
+
+Revenue, currency, trials, renewals and refunds come from authenticated
+Apphud/S2S/store-server events, never from an app-authored event. Apple
+verification is optional: Apphud-only or generic S2S money can count under its
+lower trust source; attaching an In-App Purchase key lets Daively reconcile the
+same transaction with Apple later.
+
+For low-latency Google App Conversion matching, call after StoreKit success:
+
+```swift
+TrackHub.trackPurchaseObserved(transaction)
+```
+
+This queues transaction identity and short-lived device context, never price or
+currency. It is protected from normal queue eviction. Family-shared Apple
+access is retained for audit but excluded from revenue and paid conversion
+forwarding.
+
+## Events, links and consent
 
 ```swift
 TrackHub.trackOnboardingShown()
 TrackHub.trackPaywallShown(at: .onboarding)
 TrackHub.trackPurchaseCtaTapped(at: .onboarding)
 TrackHub.trackEvent("tutorial_done", callbackParams: ["step": "3"])
-```
-
-Send funnel events at the moment they happen. Paywall placement is always sent
-as the canonical `placement_name` parameter, never appended to an event name.
-Do not send price, currency,
-trial conversion, renewal or refund as client events; Apphud/S2S owns those facts.
-
-For an enabled Google App Conversion purchase mapping, add device-side context
-after StoreKit success:
-
-```swift
-TrackHub.trackPurchaseObserved(transaction)
-```
-
-This sends no money. TrackHub joins the transaction to authoritative Apphud
-value/currency on the server.
-
-No purchase-result adapter is required. The authenticated Apphud webhook (or a
-first-party S2S event) supplies the transaction identity to Daively. With an
-In-App Purchase API key linked to the app, the server verifies that transaction
-directly through App Store Server API and seeds later reconciliation. This path
-does not call `transactionV2` and is independent of the Apphud SDK version used
-by the host app. ASSN remains the optional lower-latency notification path.
-
-## Deep links
-
-Forward cold and warm links; calling before `start` is supported:
-
-```swift
 TrackHub.handleDeepLink(url)
-```
-
-The SDK captures bounded Google/ChatGPT Ads references without taking ownership
-of application navigation.
-
-iOS has no deterministic equivalent of Android Install Referrer. Therefore
-`resolveDeferredDeepLink` currently returns `nil` and must not be used for
-onboarding routing. Ordinary universal links continue to work through
-`handleDeepLink`.
-
-## ATT and identifiers
-
-TrackHub never displays ATT automatically:
-
-```swift
 TrackHub.requestAppTrackingTransparency()
 ```
 
-Add `NSUserTrackingUsageDescription` and call only after a contextual
-explanation. IDFA is used only after authorization. IDFV and the authorized IDFA
-are synchronized to Apphud automatically.
-
-The SDK Key contains separate measurement/privacy and tracking origins. Without
-ATT authorization the SDK uses only the measurement origin; ATT-authorized
-tracking traffic uses the domain declared in `NSPrivacyTrackingDomains`.
-
-## Consent updates
+Paywall placement is sent as the `placement_name` parameter. Do not encode it
+in the event name. Do not mirror billing lifecycle or money as client events.
 
 ```swift
 TrackHub.updateGoogleAdsConsent(newGoogleConsent)
 TrackHub.updatePIPLConsent(newPiplConsent)
 TrackHub.updateCountryCode("US")
-TrackHub.updateFirebaseAppInstanceId(firebaseId)
-TrackHub.updateGoogleOnDeviceMeasurementInfo(odmInfo)
 ```
 
-Unknown consent stays unknown and is not treated as granted.
+Country is optional and must be actual measurement geography, not device
+language. TrackHub does not read it from Apphud. A trusted Daively edge country
+overrides this fallback. Unknown consent remains unknown, never granted.
 
-## Attribution
+## Privacy and failure behavior
 
-The TrackHub → Apphud custom-attribution bridge is automatic. To read the same
-snapshot for host UI:
+`TrackHub.gdprForgetMe()` stops local measurement immediately, clears queued
+measurement and persists a crash-safe device-erasure task. It still works while
+the runtime safety circuit is open.
 
-```swift
-TrackHub.attribution { attribution in
-    print(attribution?.campaignId ?? "organic")
-}
-```
+Reports are atomically stored before delivery. Transport failures, 408, 429 and
+5xx retry with jitter; ordinary 4xx rejects only that report. The bounded queue
+holds at most 1,000 reports / 4 MiB / 64 KiB per item. Install and transaction
+context reports are protected from ordinary eviction.
 
-## Privacy
+Internal storage/codec/invariant failures open a process-local fail-silent
+circuit until the next app launch. Network outages do not trip it. Swift traps,
+Objective-C exceptions, OOM, stack overflow and binary/link failures cannot be
+safely caught by an in-process SDK.
 
-```swift
-TrackHub.gdprForgetMe()
-```
-
-This immediately disables local tracking, clears queued measurement and writes
-a crash-safe device-erasure task. Network failure does not re-enable tracking.
-This is durable even when called before `TrackHub.start` and remains disabled
-after SDK Key rotation. The task retries on launch/foreground until TrackHub confirms `2xx` or `410`;
-the per-install credential and install ID are deleted last.
-
-Erasure is installation-scoped. Account-wide erasure for a logged-in product is
-a separate authenticated server operation, not a mobile SDK dependency.
-
-## Test Lab
-
-```swift
-var config = TrackHubConfig(
-    sdkKey: "<TRACKHUB_SDK_KEY>",
-    environment: .testLab(token: "<RUN_TOKEN>")
-)
-config.debugLogging = true
-TrackHub.start(config)
-```
-
-Test Lab has an isolated queue namespace and never drains production events.
-
-## Failure behavior
-
-- public calls never wait on TrackHub network I/O;
-- reports are atomically stored under Application Support before delivery;
-- corrupt/oversized queue files are quarantined instead of crashing the host;
-- transport errors, 408, 429 and 5xx retry with full jitter capped at 5 minutes;
-- ordinary 4xx rejects only the bad report and unblocks FIFO;
-- clock-skew 401 applies one bounded process-local correction;
-- queue limits: 1,000 reports, 4 MiB total, 64 KiB per report;
-- install reports have eviction priority;
-- no TrackHub token/secret is logged or persisted in the measurement queue.
-
-SDK `2.0.7` also has a process-local fail-silent circuit. A detected durable
-storage failure or unrecoverable credential rejection stops measurement for
-the rest of the current process, preserves the existing disk queue and retries
-from clean state on the next app launch. That launch also sends one signed,
-idempotent and privacy-minimal Health marker. Device privacy erasure remains active.
-
-This is containment, not an impossible crash guarantee: Swift runtime traps,
-Objective-C exceptions, OOM, stack overflow and binary/linker failures cannot
-be safely intercepted by an in-process iOS library. Host callbacks must also
-accept documented optional values instead of force-unwrapping them.
-
-## Building and checks
+## Verification
 
 ```bash
 swift build
@@ -202,8 +118,4 @@ swift test
 swift run encoder-tests
 ```
 
-`live-check` accepts endpoint, ingest token, SDK secret and optional Test Lab
-token for an intentional live smoke. Do not paste production credentials into
-shell history on shared machines.
-
-See [INTEGRATION.md](INTEGRATION.md) for the full API and release checklist.
+See [INTEGRATION.md](INTEGRATION.md) for the contract and release checklist.

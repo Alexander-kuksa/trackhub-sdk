@@ -194,23 +194,23 @@ check(TrackHub.normalizedCountryCode(" de ") == "DE",
 check(TrackHub.normalizedCountryCode("XX") == nil && TrackHub.normalizedCountryCode("Europe") == nil,
       "unknown and non-ISO country values are rejected")
 
-// ── Session coalescing (60s timeout, monotonic sequence) ──────────────────────
+// ── Session coalescing (30-minute timeout, monotonic sequence) ───────────────
 let suiteName = "trackhub.parity.session"
 let suite = UserDefaults(suiteName: suiteName)!
 suite.removePersistentDomain(forName: suiteName)
 var sidN = 0
-let tracker = SessionTracker(timeout: 60, defaults: suite, uuid: { sidN += 1; return "sid\(sidN)" })
+let tracker = SessionTracker(timeout: 30 * 60, defaults: suite, uuid: { sidN += 1; return "sid\(sidN)" })
 let base = Date(timeIntervalSince1970: 1_000_000)
 let firstSession = tracker.foreground(at: base)
 check(firstSession?.sessionNum == 1 && firstSession?.sessionUid == "sid1",
       "first foreground starts session 1")
 tracker.background(at: base.addingTimeInterval(10))
-check(tracker.foreground(at: base.addingTimeInterval(40)) == nil,
-      "foreground within 60s coalesces into the same session")
-tracker.background(at: base.addingTimeInterval(50))
-check(tracker.foreground(at: base.addingTimeInterval(200))?.sessionNum == 2,
-      "foreground after a >60s gap starts session 2 (monotonic sequence)")
-let forcedSession = tracker.forceForeground(at: base.addingTimeInterval(201))
+check(tracker.foreground(at: base.addingTimeInterval(1_809)) == nil,
+      "foreground at 29:59 coalesces into the same session")
+tracker.background(at: base.addingTimeInterval(2_000))
+check(tracker.foreground(at: base.addingTimeInterval(3_801))?.sessionNum == 2,
+      "foreground at 30:01 starts session 2 (monotonic sequence)")
+let forcedSession = tracker.forceForeground(at: base.addingTimeInterval(3_802))
 check(forcedSession.sessionNum == 3 && forcedSession.sessionUid == "sid3",
       "a deep-link re-engagement forces a new numbered session immediately")
 
@@ -256,6 +256,18 @@ let replacementID = bounded.enqueue(PendingReport(
 check(
     installID == replacementID && bounded.items.first?.body == Data("install-2".utf8),
     "install retries deduplicate while retaining their durable FIFO id"
+)
+bounded.enqueue(PendingReport(
+    id: "transaction-a",
+    path: "sdk/purchase-context",
+    body: Data("transaction".utf8),
+    kind: "transaction_context",
+    dedupeKey: "transaction_context:txn-a"
+))
+bounded.enqueue(PendingReport(id: "event-c", path: "sdk/track", body: Data("c".utf8)))
+check(
+    bounded.items.map(\.id) == ["install-a", "transaction-a"],
+    "normal traffic cannot evict install or transaction attribution anchors"
 )
 let retryAt = Date().addingTimeInterval(60)
 check(
@@ -457,7 +469,6 @@ check(noReengagementTag == nil, "ignores an empty AdAttributionKit conversion ta
 let purchaseBody = TrackHub.purchaseContextBody(
     transactionId: "2000000123456789",
     productId: "com.example.monthly",
-    userId: "apphud-user",
     occurredAt: Date(timeIntervalSince1970: 1_780_000_000),
     firstOpenAt: Date(timeIntervalSince1970: 1_779_000_000)
 )
@@ -467,6 +478,8 @@ check(purchaseBody["product_id"] as? String == "com.example.monthly",
       "purchase context carries the product id")
 check((purchaseBody["install_uid"] as? String)?.isEmpty == false,
       "purchase context carries the installation scope for device erasure")
+check(purchaseBody["user_id"] as? String == purchaseBody["install_uid"] as? String,
+      "purchase context uses the immutable installation identity")
 check(purchaseBody["first_open_at"] as? String == "2026-05-17T06:40:00Z",
       "purchase context carries the stable first-open timestamp required as fot")
 check(purchaseBody["revenue_cents"] == nil && purchaseBody["currency"] == nil,
@@ -524,40 +537,20 @@ check(
     "placement-dependent sales events fail closed without a standard placement"
 )
 
-// ── Apphud attribution bridge revision dedup ──────────────────────────────────────
-let attributionSuiteName = "trackhub.parity.apphud-attribution"
-let attributionDefaults = UserDefaults(suiteName: attributionSuiteName)!
-attributionDefaults.removePersistentDomain(forName: attributionSuiteName)
+// ── Provider-neutral external identity namespace ────────────────────────────
 check(
-    TrackHub.shouldDeliverApphudAttribution(
-        revision: "tp-1",
-        userId: "apphud-user",
-        defaults: attributionDefaults
-    ),
-    "an unseen Apphud attribution revision is deliverable"
-)
-TrackHub.markApphudAttributionDelivered(
-    revision: "tp-1",
-    userId: "apphud-user",
-    defaults: attributionDefaults
+    TrackHub.normalizedExternalProviderForTesting(" Apphud ") == "apphud",
+    "Apphud identity is provider-scoped without importing ApphudSDK"
 )
 check(
-    !TrackHub.shouldDeliverApphudAttribution(
-        revision: "tp-1",
-        userId: "apphud-user",
-        defaults: attributionDefaults
-    ),
-    "an acknowledged Apphud attribution revision is suppressed"
+    TrackHub.normalizedExternalProviderForTesting("revenuecat") == "revenuecat",
+    "RevenueCat identity is an independent provider namespace"
 )
 check(
-    TrackHub.shouldDeliverApphudAttribution(
-        revision: "tp-2",
-        userId: "apphud-user",
-        defaults: attributionDefaults
-    ),
-    "a changed Apphud attribution revision is deliverable"
+    TrackHub.normalizedExternalProviderForTesting("custom:billing_v2") == "custom:billing_v2" &&
+    TrackHub.normalizedExternalProviderForTesting("custom:bad value") == nil,
+    "custom provider names are bounded and fail closed"
 )
-attributionDefaults.removePersistentDomain(forName: attributionSuiteName)
 
 print(failures == 0 ? "\nAll Swift tests passed (incl. signature parity)" : "\n\(failures) test(s) failed")
 exit(failures == 0 ? 0 : 1)

@@ -7,10 +7,10 @@
     the SDK do NOT inherit undeclared data-use / required-reason-API obligations.
     When the host app explicitly requests ATT and receives authorization,
     TrackHub reads IDFA for attribution and sends tracking-eligible requests to
-    the tracking endpoint below and to the Apphud bridge. Without authorization
+    the tracking endpoint below. Without authorization
     it uses the separate measurement/privacy endpoint from the SDK key, so iOS
     can still deliver limited measurement and erasure. The host app remains
-    responsible for its consent UX, Apphud disclosure and App Store privacy
+    responsible for its consent UX, billing-provider disclosure and App Store privacy
     answers. Self-hosted builds must replace the domain below with their own
     tracking origin before distribution.
   -->
@@ -37,7 +37,7 @@
       </array>
     </dict>
     <dict>
-      <!-- Apphud/account identity supplied by the host app -->
+      <!-- optional provider identity supplied explicitly by the host app -->
       <key>NSPrivacyCollectedDataType</key>
       <string>NSPrivacyCollectedDataTypeUserID</string>
       <key>NSPrivacyCollectedDataTypeLinked</key>
@@ -67,7 +67,7 @@
       </array>
     </dict>
     <dict>
-      <!-- observed transaction/product identity; price and currency stay in Apphud -->
+      <!-- observed transaction/product identity; price and currency stay server-side -->
       <key>NSPrivacyCollectedDataType</key>
       <string>NSPrivacyCollectedDataTypePurchaseHistory</string>
       <key>NSPrivacyCollectedDataTypeLinked</key>
