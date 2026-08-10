@@ -4,15 +4,15 @@ TrackHub measures app installations, 30-minute foreground sessions, engagement,
 SKAdNetwork/AdAttributionKit values and short-lived purchase context. It has no
 dependency on Apphud, RevenueCat or another billing SDK.
 
-Current public release: `3.0.1`. The next patch is `3.0.2`; it remains
-unpublished until the matching Daively `/install` geography contract is live.
+Current public release: `3.0.2`. Its matching Daively `/install` geography
+contract is live and was verified before this SDK release.
 Requirements: iOS 15+, Swift Package Manager, and a TrackHub SDK Key copied
 from Daively → App → Setup. No application backend or login system is required.
 
 ## Install and start
 
 Add `https://github.com/Alexander-kuksa/trackhub-sdk` in Xcode and select
-`3.0.1` or a compatible `3.x` range.
+`3.0.2` or a compatible `3.x` range.
 
 ```swift
 import TrackHub
