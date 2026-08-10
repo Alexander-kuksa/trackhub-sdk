@@ -248,7 +248,9 @@ public enum TrackHub {
             // stop and committing its erasure job. A confirmed erasure has
             // already removed installUid, so it is not recreated.
             if persistedPrivacyStop, pendingPrivacyErasure == nil,
-               let retainedInstallUid = UserDefaults.standard.string(forKey: installUidKey),
+               let retainedInstallUid = InstallIdentityStore.loadExisting(
+                    legacyKey: installUidKey
+               ),
                !retainedInstallUid.isEmpty,
                persistPendingErasure(
                     installUid: retainedInstallUid,
@@ -422,7 +424,7 @@ public enum TrackHub {
         // call made before start() is still crash-safe.
         if UserDefaults.standard.bool(forKey: privacyDisabledKey),
            !hasPendingErasureState(),
-           UserDefaults.standard.string(forKey: installUidKey) == nil {
+           InstallIdentityStore.loadExisting(legacyKey: installUidKey) == nil {
             DispatchQueue.main.async { completion?(true) }
             return
         }
@@ -759,21 +761,53 @@ public enum TrackHub {
     /// Tracks a non-financial engagement event → TrackHub analytics and applies
     /// the SKAN conversion value when the active schema has a matching rule.
     /// Purchases use `trackPurchaseObserved`; billing remains server-sourced.
+    @_spi(Testing) public static func deduplicatedClientEventId(
+        installUid: String,
+        eventName: String,
+        deduplicationId: String
+    ) -> String? {
+        let normalizedEventName = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = deduplicationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedEventName.isEmpty,
+              !normalized.isEmpty,
+              normalized.utf8.count <= 256 else { return nil }
+        let material = Data("\(installUid)\u{0}\(normalizedEventName)\u{0}\(normalized)".utf8)
+        let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
+        return "dedup1-\(digest)"
+    }
+
     public static func trackEvent(
         _ name: String,
         callbackParams: [String: Any] = [:],
         partnerParams: [String: Any] = [:],
         adAttributionTarget: AdAttributionConversionTarget = .all,
-        conversionTag: String? = nil
+        conversionTag: String? = nil,
+        deduplicationId: String? = nil
     ) {
         guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedName.isEmpty else { return }
+        let normalizedDeduplicationId = deduplicationId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedDeduplicationId,
+           !normalizedDeduplicationId.isEmpty,
+           normalizedDeduplicationId.utf8.count > 256 {
+            return log("trackEvent deduplicationId exceeds 256 UTF-8 bytes — skipped")
+        }
         queue.async {
             guard !isRuntimeCircuitOpen() else { return }
             guard config != nil else { return log("trackEvent(\(name)) before start — skipped") }
             let installUid = resolveInstallUid()
+            let clientEventId = normalizedDeduplicationId.flatMap {
+                deduplicatedClientEventId(
+                    installUid: installUid,
+                    eventName: normalizedName,
+                    deduplicationId: $0
+                )
+            } ?? UUID().uuidString
             var body: [String: Any] = [
-                "client_event_id": UUID().uuidString,
-                "event_name": name,
+                "client_event_id": clientEventId,
+                "event_name": normalizedName,
                 "user_id": installUid,
                 "install_uid": installUid,
                 "occurred_at": iso8601.string(from: Date()),
@@ -793,7 +827,7 @@ public enum TrackHub {
             send(path: "sdk/track", body: body)
         }
         track(
-            name,
+            normalizedName,
             adAttributionTarget: adAttributionTarget,
             conversionTag: conversionTag
         )
@@ -808,7 +842,8 @@ public enum TrackHub {
         callbackParams: [String: Any] = [:],
         partnerParams: [String: Any] = [:],
         adAttributionTarget: AdAttributionConversionTarget = .all,
-        conversionTag: String? = nil
+        conversionTag: String? = nil,
+        deduplicationId: String? = nil
     ) {
         guard let payload = salesEventPayload(
             event,
@@ -822,44 +857,51 @@ public enum TrackHub {
             callbackParams: payload.callbackParams,
             partnerParams: partnerParams,
             adAttributionTarget: adAttributionTarget,
-            conversionTag: conversionTag
+            conversionTag: conversionTag,
+            deduplicationId: deduplicationId
         )
     }
 
     public static func trackOnboardingShown(
         callbackParams: [String: Any] = [:],
-        partnerParams: [String: Any] = [:]
+        partnerParams: [String: Any] = [:],
+        deduplicationId: String? = nil
     ) {
         trackSalesEvent(
             .onboardingShown,
             callbackParams: callbackParams,
-            partnerParams: partnerParams
+            partnerParams: partnerParams,
+            deduplicationId: deduplicationId
         )
     }
 
     public static func trackPaywallShown(
         at placement: TrackHubSalesPlacement,
         callbackParams: [String: Any] = [:],
-        partnerParams: [String: Any] = [:]
+        partnerParams: [String: Any] = [:],
+        deduplicationId: String? = nil
     ) {
         trackSalesEvent(
             .paywallShown,
             placement: placement,
             callbackParams: callbackParams,
-            partnerParams: partnerParams
+            partnerParams: partnerParams,
+            deduplicationId: deduplicationId
         )
     }
 
     public static func trackPurchaseCtaTapped(
         at placement: TrackHubSalesPlacement,
         callbackParams: [String: Any] = [:],
-        partnerParams: [String: Any] = [:]
+        partnerParams: [String: Any] = [:],
+        deduplicationId: String? = nil
     ) {
         trackSalesEvent(
             .purchaseCtaTapped,
             placement: placement,
             callbackParams: callbackParams,
-            partnerParams: partnerParams
+            partnerParams: partnerParams,
+            deduplicationId: deduplicationId
         )
     }
 
@@ -1644,9 +1686,13 @@ public enum TrackHub {
             }
             .forEach { UserDefaults.standard.removeObject(forKey: $0) }
         if let retainingInstallUid {
-            UserDefaults.standard.set(retainingInstallUid, forKey: installUidKey)
+            if !InstallIdentityStore.retain(retainingInstallUid, legacyKey: installUidKey) {
+                log("install identity could not be retained for privacy erasure")
+            }
         } else {
-            UserDefaults.standard.removeObject(forKey: installUidKey)
+            if !InstallIdentityStore.remove(legacyKey: installUidKey) {
+                log("install identity file could not be removed")
+            }
         }
     }
 
@@ -1684,7 +1730,9 @@ public enum TrackHub {
         InstallCredentialStore.deleteAll()
         // The credential and install id are erased last: both are required to
         // authorize/recover an offline privacy job.
-        UserDefaults.standard.removeObject(forKey: installUidKey)
+        if !InstallIdentityStore.remove(legacyKey: installUidKey) {
+            log("install identity file could not be removed after privacy erasure")
+        }
         try? FileManager.default.removeItem(at: pendingErasureFileURL())
         UserDefaults.standard.removeObject(forKey: privacyPendingKey)
         privacyErasureInFlight = false
@@ -2114,12 +2162,12 @@ public enum TrackHub {
     }
 
     private static func resolveInstallUid() -> String {
-        if let existing = UserDefaults.standard.string(forKey: installUidKey), !existing.isEmpty {
-            return existing
+        let resolution = InstallIdentityStore.resolve(legacyKey: installUidKey)
+        if !resolution.isDurable {
+            openRuntimeCircuit(.storage, detail: "install identity persistence failed")
+            log("install identity is not durable — measurement disabled for this process")
         }
-        let id = UUID().uuidString
-        UserDefaults.standard.set(id, forKey: installUidKey)
-        return id
+        return resolution.value
     }
 
     // Google's App Conversion API requires `fot` on every post-install event.
