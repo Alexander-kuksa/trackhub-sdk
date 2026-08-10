@@ -26,9 +26,11 @@ TrackHub.setExternalIdentity(provider: "custom:billing", userId: currentBillingI
 ```
 
 Call after provider initialization and again when its ID changes. `nil` logs out
-only that provider. The call is non-blocking, durable and safe before the install
-report is acknowledged: the server returns retryable `503` until the installation
-exists. No Apphud or RevenueCat code is compiled into TrackHub.
+only that provider. The call is non-blocking and durable. Before a production
+install is acknowledged, the SDK persists the desired identity but defers its
+network request; Test Lab remains independent. Version 3.0.1 also repairs a
+persisted 3.0.0 queue by delivering a later install ahead of a blocked identity.
+No Apphud or RevenueCat code is compiled into TrackHub.
 
 ## Public methods
 

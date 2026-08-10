@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.0.0"
+    public static let sdkVersion = "3.0.1"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -348,7 +348,8 @@ public enum TrackHub {
 
     /// Bind or clear an optional billing identity without importing that
     /// provider's SDK. Apphud, RevenueCat and custom providers are independent.
-    /// Safe to call immediately after `start`; delivery is durable and retried.
+    /// Safe to call immediately after `start`; the desired value is durable,
+    /// while network delivery waits until the production install is accepted.
     public static func setExternalIdentity(provider: String, userId: String?) {
         guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen(),
               let provider = normalizedExternalProvider(provider) else { return }
@@ -1919,9 +1920,13 @@ public enum TrackHub {
             scheduleRetry(at: Date().addingTimeInterval(30))
             return
         }
-        guard let report = targetQueue.items.first else { return }
+        guard let report = targetQueue.nextForDelivery else { return }
 
-        let notBefore = max(report.nextAttemptAt, transientRetryNotBefore ?? .distantPast)
+        let isFifoHead = targetQueue.items.first?.id == report.id
+        let transientNotBefore = isFifoHead
+            ? (transientRetryNotBefore ?? .distantPast)
+            : .distantPast
+        let notBefore = max(report.nextAttemptAt, transientNotBefore)
         if notBefore > Date() {
             scheduleRetry(at: notBefore)
             return
@@ -2030,6 +2035,7 @@ public enum TrackHub {
                 UserDefaults.standard.set(true, forKey: installSentKey)
                 saveInstallCredential(from: responseData)
                 log("install reported")
+                syncPersistedExternalIdentities()
                 reportConsentUpdate()
                 fetchAttributionIfNeeded()
             case "test_install":
@@ -2214,6 +2220,15 @@ public enum TrackHub {
     // the latest provider-scoped state on the next launch.
     private static func syncExternalIdentity(provider: String, userId: String?) {
         guard config != nil, normalizedExternalProvider(provider) == provider else { return }
+        let installAcknowledged = UserDefaults.standard.bool(forKey: installSentKey)
+        let isIntegrationTest = config?.integrationTestToken != nil
+        guard shouldEnqueueExternalIdentity(
+            installAcknowledged: installAcknowledged,
+            integrationTest: isIntegrationTest
+        ) else {
+            log("external identity waiting for install acknowledgement")
+            return
+        }
         let fingerprint = externalIdentityFingerprint(provider: provider, userId: userId)
         let acknowledged = UserDefaults.standard.dictionary(forKey: externalIdentityAckKey)
             as? [String: String] ?? [:]
@@ -2239,6 +2254,13 @@ public enum TrackHub {
             reportPushTokenIfAvailable()
             syncServerConversionValue()
         }
+    }
+
+    @_spi(Testing) public static func shouldEnqueueExternalIdentity(
+        installAcknowledged: Bool,
+        integrationTest: Bool
+    ) -> Bool {
+        integrationTest || installAcknowledged
     }
 
     #if os(iOS) && canImport(AppTrackingTransparency)

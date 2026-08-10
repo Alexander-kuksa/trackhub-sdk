@@ -118,6 +118,51 @@ final class TrackHubTests: XCTestCase {
         XCTAssertTrue(queue.storageFailure)
     }
 
+    func testExternalIdentityWaitsForProductionInstallAcknowledgement() {
+        XCTAssertFalse(TrackHub.shouldEnqueueExternalIdentity(
+            installAcknowledged: false,
+            integrationTest: false
+        ))
+        XCTAssertTrue(TrackHub.shouldEnqueueExternalIdentity(
+            installAcknowledged: true,
+            integrationTest: false
+        ))
+        XCTAssertTrue(TrackHub.shouldEnqueueExternalIdentity(
+            installAcknowledged: false,
+            integrationTest: true
+        ))
+    }
+
+    func testLegacyIdentityHeadLetsProductionInstallSelfHealFirst() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("trackhub-ordering-xctest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = EventQueue(url: directory.appendingPathComponent("queue.json"))
+        let identity = PendingReport(
+            path: "sdk/identity",
+            body: Data("{}".utf8),
+            kind: "external_identity"
+        )
+        let event = PendingReport(
+            path: "sdk/track",
+            body: Data("{}".utf8),
+            kind: "event"
+        )
+        let install = PendingReport(
+            path: "sdk/install",
+            body: Data("{}".utf8),
+            kind: "production_install"
+        )
+        XCTAssertNotNil(queue.enqueue(identity))
+        XCTAssertNotNil(queue.enqueue(event))
+        XCTAssertNotNil(queue.enqueue(install))
+
+        XCTAssertEqual(queue.nextForDelivery?.id, install.id)
+        XCTAssertTrue(queue.remove(id: install.id))
+        XCTAssertEqual(queue.nextForDelivery?.id, identity.id)
+    }
+
     func testRuntimeCircuitIsProcessLocalAndResettableForTests() {
         TrackHub.resetRuntimeCircuitForTesting()
         XCTAssertFalse(TrackHub.runtimeCircuitOpenForTesting())

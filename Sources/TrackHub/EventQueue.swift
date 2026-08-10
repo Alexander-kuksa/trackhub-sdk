@@ -112,6 +112,16 @@ import Foundation
 
     public var count: Int { items.count }
 
+    /// Preserve FIFO delivery except for the SDK 3.0.0 identity/install
+    /// ordering defect. A persisted external identity cannot be accepted by
+    /// the server before the installation exists, so let the one-shot install
+    /// anchor pass it without reordering any unrelated analytics traffic.
+    var nextForDelivery: PendingReport? {
+        guard let first = items.first else { return nil }
+        guard first.kind == "external_identity" else { return first }
+        return items.first(where: { $0.kind == "production_install" }) ?? first
+    }
+
     /// Returns the accepted report id, or nil when serialization/storage limits
     /// prevent acceptance. Before first unlock, iOS protected storage can be
     /// temporarily unreadable; new reports remain in memory and are merged

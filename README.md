@@ -4,14 +4,14 @@ TrackHub measures app installations, 30-minute foreground sessions, engagement,
 SKAdNetwork/AdAttributionKit values and short-lived purchase context. It has no
 dependency on Apphud, RevenueCat or another billing SDK.
 
-Current release: `3.0.0`. Requirements: iOS 15+, Swift Package Manager, and a
+Current release: `3.0.1`. Requirements: iOS 15+, Swift Package Manager, and a
 TrackHub SDK Key copied from Daively → App → Setup. No application backend or
 login system is required.
 
 ## Install and start
 
 Add `https://github.com/Alexander-kuksa/trackhub-sdk` in Xcode and select
-`3.0.0` or a compatible `3.x` range.
+`3.0.1` or a compatible `3.x` range.
 
 ```swift
 import TrackHub
@@ -45,7 +45,9 @@ TrackHub.setExternalIdentity(provider: "apphud", userId: nil)
 Supported namespaces are `apphud`, `revenuecat`, and `custom:<slug>`. Providers
 are independent. Linking one never renames the TrackHub installation and never
 clears another provider. TrackHub therefore works without a billing SDK and is
-not tied to any Apphud version.
+not tied to any Apphud version. The desired link is saved immediately; its
+network delivery waits for the production install acknowledgement so it cannot
+block the install behind a retrying identity request.
 
 If the host wants attribution visible inside Apphud/RevenueCat, it should use
 `TrackHub.attribution` and the billing provider's own public API. TrackHub does
