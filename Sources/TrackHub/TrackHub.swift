@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import CoreFoundation
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -76,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.0.2"
+    public static let sdkVersion = "3.0.3"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -161,11 +160,14 @@ public enum TrackHub {
     private static let adPersonalizationKey = "trackhub.consent.ad_personalization"
     private static let eeaKey = "trackhub.consent.eea"
     private static let countryCodeKey = "trackhub.country_code"
-    private static let measurementCountryKey = "trackhub.measurement_geo.country.v1"
-    private static let measurementEeaKey = "trackhub.measurement_geo.eea.v1"
-    private static let measurementGeoInstallUidKey = "trackhub.measurement_geo.install_uid.v1"
-    private static let measurementGeoRefreshTerminalKey = "trackhub.measurement_geo.refresh_terminal.v1"
-    private static let measurementGeoRefreshDedupeKey = "install_geo_refresh_v1"
+    // SDK 3.0.2 briefly persisted server-returned geography. 3.0.3 returns
+    // geography ownership to the server and removes that retired local state.
+    private static let retiredMeasurementGeoKeys = [
+        "trackhub.measurement_geo.country.v1",
+        "trackhub.measurement_geo.eea.v1",
+        "trackhub.measurement_geo.install_uid.v1",
+        "trackhub.measurement_geo.refresh_terminal.v1",
+    ]
     private static let piplConsentKey = "trackhub.consent.pipl"
     private static let crossBorderTransferConsentKey = "trackhub.consent.cross_border_transfer"
     private static let adsMeasurementConsentKey = "trackhub.consent.ads_measurement"
@@ -182,7 +184,6 @@ public enum TrackHub {
     private static let maxReportBytes = EventQueue.defaultMaxItemBytes
     private static let retryBaseInterval: TimeInterval = 1
     private static let retryMaxInterval: TimeInterval = 5 * 60
-    private static let maxMeasurementGeoRefreshAttempts = 12
     private static let runtimeCircuitLock = NSLock()
     private static var runtimeCircuitOpen = false
 
@@ -239,6 +240,7 @@ public enum TrackHub {
             if let country = normalizedCountryCode(configuration.countryCode) {
                 UserDefaults.standard.set(country, forKey: countryCodeKey)
             }
+            purgeRetiredMeasurementGeographyState()
             migrateLegacyPrivacyState()
             var pendingPrivacyErasure = loadPendingErasure()
             let persistedPrivacyStop = UserDefaults.standard.bool(forKey: privacyDisabledKey)
@@ -276,6 +278,11 @@ public enum TrackHub {
                 ))
                 eventQueueNamespace = namespace
             }
+            // Retire an upgrade-refresh report queued by SDK 3.0.2 without
+            // making another install request. Normal install reports remain.
+            eventQueue?.items
+                .filter { $0.kind == "install_geo_refresh" }
+                .forEach { _ = eventQueue?.remove(id: $0.id) }
             if trackingDisabled {
                 log("tracking disabled after a privacy erasure request")
                 stopAndClearLocalMeasurement(retainingInstallUid: pendingPrivacyErasure?.installUid)
@@ -775,7 +782,7 @@ public enum TrackHub {
                 "sdk_source": "trackhub-ios",
             ]
             appendAppConversionUserAgentContext(to: &body)
-            appendMeasurementGeography(to: &body)
+            if let country = currentCountryCode() { body["country"] = country }
             if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
                 body["app_version"] = version
             }
@@ -935,7 +942,7 @@ public enum TrackHub {
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
             body["app_version"] = v
         }
-        appendMeasurementGeography(to: &body)
+        if let country = currentCountryCode() { body["country"] = country }
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
         return body
@@ -1023,7 +1030,7 @@ public enum TrackHub {
             "sdk_source": "trackhub-ios",
         ]
         appendAppConversionUserAgentContext(to: &body)
-        appendMeasurementGeography(to: &body)
+        if let country = currentCountryCode() { body["country"] = country }
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String { body["app_version"] = v }
         let defaults = UserDefaults.standard
         if let gclid = defaults.string(forKey: pendingGclidKey) { body["gclid"] = gclid }
@@ -1061,24 +1068,6 @@ public enum TrackHub {
             ingestToken: config.ingestToken,
             installUid: installUid
         ) != nil
-        if !isIntegrationTest, installAlreadySent, hasCredential {
-            let hasCachedGeo = hasCachedMeasurementGeography(installUid: installUid)
-            let refreshTerminal = defaults.string(forKey: measurementGeoRefreshTerminalKey)
-                == installUid
-            let refreshPending = eventQueue?.items.contains {
-                $0.dedupeKey == measurementGeoRefreshDedupeKey
-            } == true
-            if shouldRefreshMeasurementGeography(
-                installAlreadySent: installAlreadySent,
-                hasCredential: hasCredential,
-                hasCachedGeo: hasCachedGeo,
-                refreshTerminal: refreshTerminal,
-                refreshPending: refreshPending
-            ) {
-                reportMeasurementGeographyRefresh()
-            }
-            return
-        }
         let bootstrapKey = installCredentialBootstrapKey(token: config.ingestToken)
         if !isIntegrationTest && !shouldReportInstallForCredential(
             installAlreadySent: installAlreadySent,
@@ -1103,20 +1092,9 @@ public enum TrackHub {
         }
     }
 
-    private static func reportMeasurementGeographyRefresh() {
-        let installUid = resolveInstallUid()
-        let accepted = send(
-            path: "install",
-            body: installContextBody(installUid: installUid),
-            kind: "install_geo_refresh",
-            dedupeKey: measurementGeoRefreshDedupeKey
-        )
-        if accepted { log("measurement geography refresh queued") }
-    }
-
     private static func installContextBody(installUid: String) -> [String: Any] {
         // sdk_* stay inside the signed body so the HMAC authenticates the
-        // integration marker and the idempotent geography refresh alike.
+        // integration marker too.
         var body: [String: Any] = [
             "user_id": installUid,
             "install_uid": installUid,
@@ -1131,7 +1109,7 @@ public enum TrackHub {
             body["app_version"] = value
         }
         appendAppConversionUserAgentContext(to: &body)
-        appendMeasurementGeography(to: &body)
+        if let country = currentCountryCode() { body["country"] = country }
         // Google click ids captured from a deep link (set via setGoogleClickId /
         // handleDeepLink before start) — the iOS path for user-level Google
         // attribution + conversion return.
@@ -1178,6 +1156,9 @@ public enum TrackHub {
         if defaults.object(forKey: adPersonalizationKey) != nil {
             body["ad_personalization"] = defaults.bool(forKey: adPersonalizationKey)
         }
+        if defaults.object(forKey: eeaKey) != nil {
+            body["eea"] = defaults.bool(forKey: eeaKey)
+        }
         if defaults.object(forKey: piplConsentKey) != nil {
             body["pipl_consent"] = defaults.bool(forKey: piplConsentKey)
         }
@@ -1203,7 +1184,6 @@ public enum TrackHub {
             "sdk_version": Self.sdkVersion,
             "platform": "ios",
         ]
-        appendMeasurementGeography(to: &body)
         appendConsent(to: &body)
         appendOdmInfo(to: &body)
         appendAppConversionDeviceIdentifier(to: &body)
@@ -1649,14 +1629,13 @@ public enum TrackHub {
             adUserDataKey, adPersonalizationKey, eeaKey,
             piplConsentKey, crossBorderTransferConsentKey, adsMeasurementConsentKey,
             countryCodeKey, adAttributionConversionTagKey,
-            measurementCountryKey, measurementEeaKey, measurementGeoInstallUidKey,
-            measurementGeoRefreshTerminalKey,
             externalIdentitiesKey, externalIdentityAckKey,
             installSentKey, firstOpenAtKey, schemaCacheKey,
             highestInstallFineKey, "trackhub.session_seq", "trackhub.session_last_activity",
         ] {
             UserDefaults.standard.removeObject(forKey: key)
         }
+        purgeRetiredMeasurementGeographyState()
         UserDefaults.standard.dictionaryRepresentation().keys
             .filter {
                 $0.hasPrefix(highestInstallCoarseKeyPrefix)
@@ -2026,32 +2005,8 @@ public enum TrackHub {
             return
         }
         let correctedClock = status == 401 && applyServerClock(responseData)
-        let waitingForGeoAck = report.kind == "install_geo_refresh"
-            && shouldAwaitMeasurementGeoAck(
-                statusIsSuccess: isSuccess(status),
-                ackVersion: parseMeasurementGeographyAck(
-                    responseData,
-                    expectedInstallUid: resolveInstallUid()
-                )?.version
-            )
-        if correctedClock || isRetryable(status) || waitingForGeoAck {
+        if correctedClock || isRetryable(status) {
             let attempts = report.attempts + 1
-            if report.kind == "install_geo_refresh",
-               shouldTerminateMeasurementGeoRefresh(attempts: attempts) {
-                let completion = deliveryCompletions.removeValue(forKey: report.id)
-                guard targetQueue.remove(id: report.id) else {
-                    log("measurement geography refresh could not be retired")
-                    if targetQueue.storageFailure {
-                        openRuntimeCircuit(.storage, detail: "geo refresh queue removal failed")
-                    }
-                    completion?(status)
-                    return
-                }
-                markMeasurementGeoRefreshTerminal()
-                log("measurement geography refresh exhausted its bounded retries")
-                completion?(status)
-                return
-            }
             let delay = correctedClock && attempts <= 3
                 ? 1
                 : retryDelay(attempt: attempts, jitter: Double.random(in: 0...1))
@@ -2071,9 +2026,7 @@ public enum TrackHub {
             }
             log(correctedClock
                 ? "device clock corrected — retrying \(report.path)"
-                : waitingForGeoAck
-                    ? "measurement geography contract not active — retrying with backoff"
-                    : "\(report.path) delivery failed — retrying with backoff")
+                : "\(report.path) delivery failed — retrying with backoff")
             return
         }
 
@@ -2093,19 +2046,8 @@ public enum TrackHub {
                 openRuntimeCircuit(.storage, detail: "offline delivery state persistence failed")
             }
         }
-        if report.kind == "install_geo_refresh", !isSuccess(status) {
-            markMeasurementGeoRefreshTerminal()
-        }
         let completion = deliveryCompletions.removeValue(forKey: report.id)
         if isSuccess(status) {
-            // Any successful production /install ACK may replace the cached
-            // first-party geography. Test Lab must not contaminate it.
-            if report.path == "install", report.kind != "test_install" {
-                if hasMeasurementGeoAckV1(responseData) {
-                    _ = saveMeasurementGeography(from: responseData)
-                    markMeasurementGeoRefreshTerminal()
-                }
-            }
             if report.path == "sdk/session"
                 || report.path == "sdk/track"
                 || report.path == "sdk/conversion-value" {
@@ -2119,8 +2061,6 @@ public enum TrackHub {
                 syncPersistedExternalIdentities()
                 reportConsentUpdate()
                 fetchAttributionIfNeeded()
-            case "install_geo_refresh":
-                log("measurement geography refresh acknowledged")
             case "test_install":
                 log("integration-test install reported")
             default:
@@ -2208,164 +2148,14 @@ public enum TrackHub {
         return value
     }
 
-    @_spi(Testing) public struct MeasurementGeographyAck: Equatable {
-        public let version: Int?
-        public let country: String?
-        public let eea: Bool?
+    private static func currentCountryCode() -> String? {
+        normalizedCountryCode(UserDefaults.standard.string(forKey: countryCodeKey))
+    }
 
-        public init(version: Int?, country: String?, eea: Bool?) {
-            self.version = version
-            self.country = country
-            self.eea = eea
+    internal static func purgeRetiredMeasurementGeographyState() {
+        for key in retiredMeasurementGeoKeys {
+            UserDefaults.standard.removeObject(forKey: key)
         }
-    }
-
-    @_spi(Testing) public static func parseMeasurementGeographyAck(
-        _ responseData: Data?,
-        expectedInstallUid: String
-    ) -> MeasurementGeographyAck? {
-        guard let responseData,
-              let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]
-        else { return nil }
-        if let rawInstallUid = json["install_uid"] {
-            guard let responseInstallUid = rawInstallUid as? String,
-                  responseInstallUid == expectedInstallUid else { return nil }
-        }
-        let version = strictGeoAckVersion(json["geo_ack_version"])
-        let country: String?
-        if let rawCountry = json["country"] {
-            guard let value = rawCountry as? String,
-                  let normalized = normalizedCountryCode(value) else { return nil }
-            country = normalized
-        } else {
-            country = nil
-        }
-        let eea: Bool?
-        if let rawEea = json["eea"] {
-            guard let value = strictBoolean(rawEea) else { return nil }
-            eea = value
-        } else {
-            eea = nil
-        }
-        return MeasurementGeographyAck(version: version, country: country, eea: eea)
-    }
-
-    @_spi(Testing) public static func resolvedMeasurementEea(
-        host: Bool?,
-        cached: Bool?
-    ) -> Bool? {
-        if host == true || cached == true { return true }
-        if host != nil || cached != nil { return false }
-        return nil
-    }
-
-    @_spi(Testing) public static func shouldRefreshMeasurementGeography(
-        installAlreadySent: Bool,
-        hasCredential: Bool,
-        hasCachedGeo: Bool,
-        refreshTerminal: Bool,
-        refreshPending: Bool
-    ) -> Bool {
-        installAlreadySent
-            && hasCredential
-            && !hasCachedGeo
-            && !refreshTerminal
-            && !refreshPending
-    }
-
-    @_spi(Testing) public static func shouldTerminateMeasurementGeoRefresh(
-        attempts: Int
-    ) -> Bool {
-        attempts >= maxMeasurementGeoRefreshAttempts
-    }
-
-    @_spi(Testing) public static func shouldAwaitMeasurementGeoAck(
-        statusIsSuccess: Bool,
-        ackVersion: Int?
-    ) -> Bool {
-        statusIsSuccess && ackVersion != 1
-    }
-
-    private static func strictBoolean(_ value: Any?) -> Bool? {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
-        return number.boolValue
-    }
-
-    private static func strictGeoAckVersion(_ value: Any?) -> Int? {
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID(),
-              number.doubleValue == 1,
-              number.intValue == 1 else { return nil }
-        return 1
-    }
-
-    private static func hasMeasurementGeoAckV1(_ responseData: Data?) -> Bool {
-        parseMeasurementGeographyAck(
-            responseData,
-            expectedInstallUid: resolveInstallUid()
-        )?.version == 1
-    }
-
-    private static func hasCachedMeasurementGeography(installUid: String) -> Bool {
-        let defaults = UserDefaults.standard
-        guard defaults.string(forKey: measurementGeoInstallUidKey) == installUid else {
-            return false
-        }
-        return normalizedCountryCode(defaults.string(forKey: measurementCountryKey)) != nil
-            || defaults.object(forKey: measurementEeaKey) != nil
-    }
-
-    private static func currentMeasurementCountry() -> String? {
-        let defaults = UserDefaults.standard
-        let installUid = resolveInstallUid()
-        if defaults.string(forKey: measurementGeoInstallUidKey) == installUid,
-           let cached = normalizedCountryCode(defaults.string(forKey: measurementCountryKey)) {
-            return cached
-        }
-        return normalizedCountryCode(defaults.string(forKey: countryCodeKey))
-    }
-
-    private static func currentMeasurementEea() -> Bool? {
-        let defaults = UserDefaults.standard
-        let host = defaults.object(forKey: eeaKey) != nil
-            ? defaults.bool(forKey: eeaKey)
-            : nil
-        let installUid = resolveInstallUid()
-        let cached = defaults.string(forKey: measurementGeoInstallUidKey) == installUid
-            && defaults.object(forKey: measurementEeaKey) != nil
-            ? defaults.bool(forKey: measurementEeaKey)
-            : nil
-        return resolvedMeasurementEea(host: host, cached: cached)
-    }
-
-    private static func appendMeasurementGeography(to body: inout [String: Any]) {
-        if let country = currentMeasurementCountry() { body["country"] = country }
-        if let eea = currentMeasurementEea() { body["eea"] = eea }
-    }
-
-    @discardableResult
-    private static func saveMeasurementGeography(from responseData: Data?) -> Bool {
-        let installUid = resolveInstallUid()
-        guard let ack = parseMeasurementGeographyAck(
-            responseData,
-            expectedInstallUid: installUid
-        ), ack.version == 1,
-           ack.country != nil || ack.eea != nil else { return false }
-        let defaults = UserDefaults.standard
-        if defaults.string(forKey: measurementGeoInstallUidKey) != installUid {
-            defaults.removeObject(forKey: measurementCountryKey)
-            defaults.removeObject(forKey: measurementEeaKey)
-        }
-        if let country = ack.country { defaults.set(country, forKey: measurementCountryKey) }
-        if let eea = ack.eea { defaults.set(eea, forKey: measurementEeaKey) }
-        defaults.set(installUid, forKey: measurementGeoInstallUidKey)
-        log("server-resolved measurement geography cached")
-        return true
-    }
-
-    private static func markMeasurementGeoRefreshTerminal() {
-        UserDefaults.standard.set(resolveInstallUid(), forKey: measurementGeoRefreshTerminalKey)
     }
 
     private static func appendAppConversionUserAgentContext(to body: inout [String: Any]) {

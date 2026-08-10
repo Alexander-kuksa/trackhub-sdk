@@ -32,35 +32,36 @@ network request; Test Lab remains independent. Version 3.0.1 also repairs a
 persisted 3.0.0 queue by delivering a later install ahead of a blocked identity.
 No Apphud or RevenueCat code is compiled into TrackHub.
 
-## First-party measurement geography (3.0.2)
+## Server-owned measurement geography (3.0.3)
 
-The production `/install` acknowledgement includes `geo_ack_version: 1` on a
-compatible server and may include ISO-3166 `country` and protective `eea`
-fields resolved by Daively's trusted edge. The SDK validates them, scopes them
-to the current `install_uid`, and durably caches them for later install,
-session, event, consent and purchase-context payloads. The cache is a device
-signal only: the server resolves trusted-edge geography again before consent or
-external-delivery decisions.
+The SDK does not learn or cache the server's geography result. On every
+official SDK request Daively resolves current geography from a trusted edge
+country header or its local country-only GeoIP database. Only when those are
+unavailable does the server use the optional host `countryCode`, followed by
+the stored installation country for later reports. Manual S2S requests skip
+request-IP GeoIP so a backend location cannot become the user's country.
 
-`countryCode` remains an optional initial host fallback. A later server country
-may replace it. EEA is monotonic-protective: host `true` OR cached `true` stays
-true; cached false cannot narrow host true. No Locale, GPS or IP-based SDK
-geolocation is performed, and no IP is persisted or added to a payload.
+No Locale, GPS or IP-based SDK geolocation is performed, and no IP is persisted
+as geography or added to an SDK payload. Host EEA/consent signals remain normal
+request inputs, but destination policy is enforced on the server. The install
+response may contain the integer `geo_ack_version: 1` compatibility marker for
+already-published 3.0.2 clients; it never contains `country` or `eea`, and 3.0.3
+ignores it.
 
-An app upgraded from 3.0.1 with an existing install credential schedules one
-durable, idempotent `/install` context refresh when its server-geo cache is
-missing. A `2xx` without `geo_ack_version: 1` is treated as an old server and
-retried with backoff. The refresh retires after 12 retryable/old-contract
-responses and fails silently. A v1 ACK with no `country` or `eea` is a valid
-terminal answer: geography is genuinely unknown. The server must encode the
-ACK version as the integer JSON token `1`, not `1.0` or a string, and must omit
-unknown country/EEA fields instead of emitting explicit `null`.
+When upgrading from 3.0.2, the SDK deletes the retired install-scoped geography
+cache and removes any queued `install_geo_refresh` report before delivery.
 
-Release gate: publish/tag 3.0.2 only after the platform contract, tests and
-production deployment are verified with a live `/install` ACK. Server-first is
-mandatory: after 12 old-contract responses the install-scoped terminal marker
-does not re-arm when the server is deployed later. Bounded retry preserves
-measurement safety but cannot recover that installation's device geo cache.
+## Consent defaults (3.0.3)
+
+`TrackHubGoogleAdsConsent()` defaults both signals to `.unknown`, and the public
+consent API is optional for a basic integration. TrackHub never presents a
+second Google consent UI. Daively fills missing signals with `GRANTED`
+globally, including confirmed EEA and unknown geography. An explicit CMP value
+always wins. Confirmed-EEA and unknown-geo grants are observable server-side
+and have separate operator kill switches. ATT authorization only makes IDFA
+technically available; it never changes either Google consent value. With
+missing EEA consent, the independent server default supplies the effective
+`ad_user_data` grant that can permit IDFA delivery.
 
 ## Public methods
 

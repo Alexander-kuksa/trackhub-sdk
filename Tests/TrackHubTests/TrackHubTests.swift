@@ -3,6 +3,13 @@ import XCTest
 @testable @_spi(Testing) import TrackHub
 
 final class TrackHubTests: XCTestCase {
+    func testGoogleAdsConsentIsOptionalAndDoesNotInferEitherSignal() {
+        let consent = TrackHubGoogleAdsConsent()
+        XCTAssertEqual(consent.adUserData, .unknown)
+        XCTAssertEqual(consent.adPersonalization, .unknown)
+        XCTAssertNil(consent.isEea)
+    }
+
     func testSdkKeyDecodesOnlyTheVersionedHttpsEnvelope() throws {
         let payload = try JSONSerialization.data(withJSONObject: [
             "e": "https://measurement.example.com",
@@ -163,101 +170,6 @@ final class TrackHubTests: XCTestCase {
         XCTAssertEqual(queue.nextForDelivery?.id, identity.id)
     }
 
-    func testMeasurementGeographyAckIsValidatedAndInstallScoped() throws {
-        let installUid = "11111111-2222-4333-8444-555555555555"
-        let valid = try JSONSerialization.data(withJSONObject: [
-            "install_uid": installUid,
-            "geo_ack_version": 1,
-            "country": "de",
-            "eea": true,
-        ])
-        XCTAssertEqual(
-            TrackHub.parseMeasurementGeographyAck(valid, expectedInstallUid: installUid),
-            TrackHub.MeasurementGeographyAck(version: 1, country: "DE", eea: true)
-        )
-
-        let oldServer = try JSONSerialization.data(withJSONObject: ["ok": true])
-        XCTAssertEqual(
-            TrackHub.parseMeasurementGeographyAck(oldServer, expectedInstallUid: installUid),
-            TrackHub.MeasurementGeographyAck(version: nil, country: nil, eea: nil)
-        )
-
-        let mismatched = try JSONSerialization.data(withJSONObject: [
-            "install_uid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "geo_ack_version": 1,
-            "country": "US",
-            "eea": false,
-        ])
-        XCTAssertNil(TrackHub.parseMeasurementGeographyAck(
-            mismatched,
-            expectedInstallUid: installUid
-        ))
-
-        let invalid = try JSONSerialization.data(withJSONObject: [
-            "country": "USA",
-            "geo_ack_version": true,
-            "eea": 1,
-        ])
-        XCTAssertNil(TrackHub.parseMeasurementGeographyAck(
-            invalid,
-            expectedInstallUid: installUid
-        ))
-
-        let malformedV1 = try JSONSerialization.data(withJSONObject: [
-            "geo_ack_version": 1,
-            "country": "USA",
-        ])
-        XCTAssertNil(TrackHub.parseMeasurementGeographyAck(
-            malformedV1,
-            expectedInstallUid: installUid
-        ))
-    }
-
-    func testMeasurementGeographyProtectiveMergeCannotNarrowEea() {
-        XCTAssertEqual(TrackHub.resolvedMeasurementEea(host: true, cached: false), true)
-        XCTAssertEqual(TrackHub.resolvedMeasurementEea(host: false, cached: true), true)
-        XCTAssertEqual(TrackHub.resolvedMeasurementEea(host: nil, cached: false), false)
-        XCTAssertNil(TrackHub.resolvedMeasurementEea(host: nil, cached: nil))
-    }
-
-    func testUpgradeGeographyRefreshIsOneBoundedDurableJob() {
-        XCTAssertTrue(TrackHub.shouldRefreshMeasurementGeography(
-            installAlreadySent: true,
-            hasCredential: true,
-            hasCachedGeo: false,
-            refreshTerminal: false,
-            refreshPending: false
-        ))
-        XCTAssertFalse(TrackHub.shouldRefreshMeasurementGeography(
-            installAlreadySent: true,
-            hasCredential: true,
-            hasCachedGeo: false,
-            refreshTerminal: false,
-            refreshPending: true
-        ))
-        XCTAssertFalse(TrackHub.shouldRefreshMeasurementGeography(
-            installAlreadySent: true,
-            hasCredential: true,
-            hasCachedGeo: false,
-            refreshTerminal: true,
-            refreshPending: false
-        ))
-        XCTAssertFalse(TrackHub.shouldTerminateMeasurementGeoRefresh(attempts: 11))
-        XCTAssertTrue(TrackHub.shouldTerminateMeasurementGeoRefresh(attempts: 12))
-        XCTAssertTrue(TrackHub.shouldAwaitMeasurementGeoAck(
-            statusIsSuccess: true,
-            ackVersion: nil
-        ))
-        XCTAssertFalse(TrackHub.shouldAwaitMeasurementGeoAck(
-            statusIsSuccess: true,
-            ackVersion: 1
-        ))
-        XCTAssertFalse(TrackHub.shouldAwaitMeasurementGeoAck(
-            statusIsSuccess: false,
-            ackVersion: nil
-        ))
-    }
-
     func testRuntimeCircuitIsProcessLocalAndResettableForTests() {
         TrackHub.resetRuntimeCircuitForTesting()
         XCTAssertFalse(TrackHub.runtimeCircuitOpenForTesting())
@@ -267,6 +179,21 @@ final class TrackHubTests: XCTestCase {
         TrackHub.resetRuntimeCircuitForTesting()
         XCTAssertFalse(TrackHub.runtimeCircuitOpenForTesting())
         XCTAssertNil(TrackHub.runtimeCircuitMarkerReasonForTesting())
+    }
+
+    func testCorrectiveUpgradeDeletesRetiredMeasurementGeographyState() {
+        let defaults = UserDefaults.standard
+        let keys: [String: Any] = [
+            "trackhub.measurement_geo.country.v1": "DE",
+            "trackhub.measurement_geo.eea.v1": true,
+            "trackhub.measurement_geo.install_uid.v1": "test-install",
+            "trackhub.measurement_geo.refresh_terminal.v1": "test-install",
+        ]
+        for (key, value) in keys { defaults.set(value, forKey: key) }
+
+        TrackHub.purgeRetiredMeasurementGeographyState()
+
+        for key in keys.keys { XCTAssertNil(defaults.object(forKey: key)) }
     }
 
     func testPrivacyRequestBeforeStartIsDurable() {
