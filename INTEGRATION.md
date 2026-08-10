@@ -52,11 +52,15 @@ durable, idempotent `/install` context refresh when its server-geo cache is
 missing. A `2xx` without `geo_ack_version: 1` is treated as an old server and
 retried with backoff. The refresh retires after 12 retryable/old-contract
 responses and fails silently. A v1 ACK with no `country` or `eea` is a valid
-terminal answer: geography is genuinely unknown.
+terminal answer: geography is genuinely unknown. The server must encode the
+ACK version as the integer JSON token `1`, not `1.0` or a string, and must omit
+unknown country/EEA fields instead of emitting explicit `null`.
 
 Release gate: publish/tag 3.0.2 only after the platform contract, tests and
-production deployment are verified. The versioned ACK makes either rollout
-order fail-safe, but server-first avoids unnecessary bounded retries.
+production deployment are verified with a live `/install` ACK. Server-first is
+mandatory: after 12 old-contract responses the install-scoped terminal marker
+does not re-arm when the server is deployed later. Bounded retry preserves
+measurement safety but cannot recover that installation's device geo cache.
 
 ## Public methods
 
