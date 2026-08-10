@@ -4,15 +4,15 @@ TrackHub measures app installations, 30-minute foreground sessions, engagement,
 SKAdNetwork/AdAttributionKit values and short-lived purchase context. It has no
 dependency on Apphud, RevenueCat or another billing SDK.
 
-Current public release: `3.0.2`. Its matching Daively `/install` geography
-contract is live and was verified before this SDK release.
+Current public release: `3.0.3`. Measurement geography is owned by Daively's
+server and is not returned to or cached by the SDK.
 Requirements: iOS 15+, Swift Package Manager, and a TrackHub SDK Key copied
 from Daively → App → Setup. No application backend or login system is required.
 
 ## Install and start
 
 Add `https://github.com/Alexander-kuksa/trackhub-sdk` in Xcode and select
-`3.0.2` or a compatible `3.x` range.
+`3.0.3` or a compatible `3.x` range.
 
 ```swift
 import TrackHub
@@ -94,15 +94,22 @@ TrackHub.updateCountryCode("US")
 ```
 
 Country is optional and must be actual measurement geography, not device
-language. From 3.0.2, the first successful production install response supplies
-server-resolved `country` / `eea` when the trusted edge can determine them. The
-SDK validates and durably caches that first-party result for later payloads.
-`countryCode` remains only an initial host fallback; the server result may
-replace it. An explicit host EEA signal and the cached signal are merged
-protectively: either `true` keeps traffic in EEA handling. TrackHub never uses
-Locale or GPS to infer geography and never discovers, stores or sends an IP
-address. The server re-evaluates every request and remains authoritative.
-Unknown consent remains unknown, never granted.
+language. `countryCode` is only a host-provided fallback in the request. Daively
+resolves current geography on every official SDK delivery from its trusted edge
+or local country-only GeoIP database, then falls back to the host value and the
+stored installation country. The response never returns `country` or `eea` to
+the SDK. Version 3.0.3 also deletes the short-lived geography cache and refresh
+job introduced in 3.0.2. TrackHub never uses Locale or GPS as geography and
+never discovers, stores or sends an IP address. Both Google consent values stay
+`unknown` in the no-CMP SDK configuration; the public consent API is optional.
+Daively applies the approved app policy server-side: missing values default to
+`GRANTED` globally, including confirmed EEA and unknown geography. An explicit
+CMP denial always wins. Confirmed-EEA and unknown-geo grants are separately
+observable and have operator kill switches. ATT is independent: denial removes
+IDFA, while authorization only makes IDFA technically available and never
+itself grants either Google signal. With missing EEA consent, the server policy
+grant can nevertheless authorize Google delivery. The SDK shows no second
+consent prompt.
 
 ## Privacy and failure behavior
 
