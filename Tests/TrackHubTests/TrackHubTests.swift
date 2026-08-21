@@ -10,6 +10,37 @@ final class TrackHubTests: XCTestCase {
         XCTAssertNil(consent.isEea)
     }
 
+    func testWbraidIsAFirstClassSessionClickReference() {
+        XCTAssertEqual(
+            TrackHub.sessionGoogleClickIds(gclid: nil, gbraid: nil, wbraid: "WBraid-MixedCase-123"),
+            ["wbraid": "WBraid-MixedCase-123"]
+        )
+        XCTAssertEqual(
+            TrackHub.sessionGoogleClickIds(gclid: "G1", gbraid: "GB1", wbraid: "WB1"),
+            ["gclid": "G1", "gbraid": "GB1", "wbraid": "WB1"]
+        )
+        XCTAssertTrue(
+            TrackHub.sessionGoogleClickIds(gclid: nil, gbraid: nil, wbraid: "").isEmpty
+        )
+    }
+
+    func testSetGoogleClickIdsPersistsWbraidForTheNextSession() {
+        let defaults = UserDefaults.standard
+        let durableKey = "trackhub.wbraid"
+        let pendingKey = "trackhub.pending_wbraid"
+        defaults.removeObject(forKey: durableKey)
+        defaults.removeObject(forKey: pendingKey)
+        defer {
+            defaults.removeObject(forKey: durableKey)
+            defaults.removeObject(forKey: pendingKey)
+        }
+
+        TrackHub.storeGoogleClickIds(gclid: nil, gbraid: nil, wbraid: "WBraid-Existing-Install")
+
+        XCTAssertEqual(defaults.string(forKey: durableKey), "WBraid-Existing-Install")
+        XCTAssertEqual(defaults.string(forKey: pendingKey), "WBraid-Existing-Install")
+    }
+
     func testSdkKeyDecodesOnlyTheVersionedHttpsEnvelope() throws {
         let payload = try JSONSerialization.data(withJSONObject: [
             "e": "https://measurement.example.com",

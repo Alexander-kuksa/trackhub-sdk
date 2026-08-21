@@ -14,7 +14,7 @@ same-device SDK update are not reliably distinguishable from that legacy mirror;
 3.0.3 intentionally preserves the previous restore behavior rather than risking
 a new identity on every update.
 
-## Optional Google integrated conversion measurement (3.0.4)
+## Optional Google integrated conversion measurement (3.0.4+)
 
 SDK 3.0.4 can hold only outbound first-open delivery for a bounded interval
 while the host obtains Google's opaque `aggregateConversionInfo`. It does not
@@ -49,6 +49,12 @@ completion asynchronously. It is called only before an unsent first open, only
 when no explicit or cached ODM value exists, and never after a persisted privacy
 stop. The default wait is three seconds and is capped at fifteen seconds via
 `googleOnDeviceMeasurementTimeout`. Host callbacks are not wrapped or swallowed.
+
+SDK 3.0.5 also treats `wbraid` as durable one-shot re-engagement evidence on
+existing installations. A `wbraid` captured by `setGoogleClickIds` or
+`handleDeepLink` forces a normal numbered session and remains pending until the
+session payload has entered the offline queue. This supports the server-side
+web-to-app/Data Manager contour without replaying the one-shot install.
 
 External billing identities are optional provider-scoped links:
 
