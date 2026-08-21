@@ -278,6 +278,24 @@ check(
     bounded.items.map(\.id) == ["install-a", "transaction-a"],
     "normal traffic cannot evict install or transaction attribution anchors"
 )
+let firstOpenOrderingURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("trackhub_first_open_ordering_\(UUID().uuidString).json")
+defer { try? FileManager.default.removeItem(at: firstOpenOrderingURL) }
+let firstOpenOrderingQueue = EventQueue(url: firstOpenOrderingURL)
+let earlySession = PendingReport(path: "sdk/session", body: Data("{}".utf8), kind: "session")
+let delayedInstall = PendingReport(
+    path: "install",
+    body: Data("{}".utf8),
+    kind: "production_install",
+    dedupeKey: "install"
+)
+_ = firstOpenOrderingQueue.enqueue(earlySession)
+_ = firstOpenOrderingQueue.enqueue(delayedInstall)
+check(firstOpenOrderingQueue.nextForDelivery?.id == delayedInstall.id,
+      "an ATT/ODM-buffered session cannot pass the one-shot install anchor")
+_ = firstOpenOrderingQueue.remove(id: delayedInstall.id)
+check(firstOpenOrderingQueue.nextForDelivery?.id == earlySession.id,
+      "FIFO resumes immediately after the install anchor")
 let retryAt = Date().addingTimeInterval(60)
 check(
     bounded.markRetry(id: "install-a", attempts: 3, nextAttemptAt: retryAt),
@@ -441,6 +459,46 @@ check(
     "Integration Test Lab is never held by the ATT timer"
 )
 
+// ── Google ODM first-open enrichment wait ───────────────────────────────────────────────
+check(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(-1) == 0,
+      "negative Google ODM waiting intervals are disabled")
+check(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(.infinity) == 0,
+      "non-finite Google ODM waiting intervals are disabled")
+check(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(3) == 3,
+      "a valid Google ODM waiting interval is preserved")
+check(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(60) == 15,
+      "Google ODM waiting interval is capped so delivery cannot stall indefinitely")
+check(
+    TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+        hasProvider: true,
+        hasExplicitInfo: false,
+        hasCachedInfo: false,
+        installAlreadySent: false,
+        privacyStopped: false
+    ),
+    "Google ODM is fetched only for an unenriched first open"
+)
+check(
+    !TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+        hasProvider: true,
+        hasExplicitInfo: false,
+        hasCachedInfo: false,
+        installAlreadySent: true,
+        privacyStopped: false
+    ),
+    "an SDK upgrade does not replay Google ODM after first_open was sent"
+)
+check(
+    !TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+        hasProvider: true,
+        hasExplicitInfo: false,
+        hasCachedInfo: false,
+        installAlreadySent: false,
+        privacyStopped: true
+    ),
+    "Google ODM is not invoked after privacy measurement stopped"
+)
+
 // ── Google click id extraction from a deep link ───────────────────────────────
 let gc = TrackHub.parseGoogleClickIds(from: URL(string: "myapp://open?gclid=CaseSensitiveGCLID")!)
 check(gc.gclid == "CaseSensitiveGCLID" && gc.gbraid == nil && gc.wbraid == nil,
@@ -455,11 +513,18 @@ check(none.gclid == nil && none.gbraid == nil && none.wbraid == nil, "empty / ab
 let openAiOppref = TrackHub.parseOpenAiOppref(
     from: URL(string: "myapp://open?oppref=%20OpenAI-Click-123%20")!
 )
-check(openAiOppref == "OpenAI-Click-123", "parses and trims the OpenAI Ads oppref")
+check(openAiOppref == "%20OpenAI-Click-123%20", "preserves the raw OpenAI Ads oppref")
 let emptyOpenAiOppref = TrackHub.parseOpenAiOppref(
-    from: URL(string: "myapp://open?oppref=%20%20")!
+    from: URL(string: "myapp://open?oppref=")!
 )
 check(emptyOpenAiOppref == nil, "empty OpenAI Ads oppref is treated as nil")
+let encodedOpenAiOppref = TrackHub.parseOpenAiOppref(
+    from: URL(string: "myapp://open?foo=1&oppref=raw%2Breference+value&bar=2")!
+)
+check(
+    encodedOpenAiOppref == "raw%2Breference+value",
+    "does not URL-decode or normalize the opaque OpenAI Ads oppref"
+)
 let oversizedOpenAiOppref = TrackHub.parseOpenAiOppref(
     from: URL(string: "myapp://open?oppref=\(String(repeating: "x", count: 1025))")!
 )

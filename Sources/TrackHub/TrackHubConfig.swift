@@ -65,6 +65,16 @@ public enum TrackHubDeliveryFailure: Sendable, Equatable {
 
 public typealias TrackHubDeliveryFailureHandler = @Sendable (TrackHubDeliveryFailure) -> Void
 
+/// Host bridge to Google's optional On-Device Measurement SDK. TrackHub keeps
+/// that SDK out of its dependency graph so applications remain free to use a
+/// Firebase-compatible GoogleAdsOnDeviceConversion version. The provider is
+/// invoked on the main actor and must return without blocking the UI; complete
+/// asynchronously with the opaque `aggregateConversionInfo`, or `nil`.
+public typealias TrackHubGoogleOnDeviceMeasurementInfoProvider = @MainActor @Sendable (
+    _ firstOpenAt: Date,
+    _ completion: @escaping @Sendable (String?) -> Void
+) -> Void
+
 public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public let sdkKey: String
     public let environment: TrackHubEnvironment
@@ -75,6 +85,10 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public var piplConsent = TrackHubPIPLConsent()
     public var firebaseAppInstanceId: String?
     public var googleOnDeviceMeasurementInfo: String?
+    public var googleOnDeviceMeasurementInfoProvider: TrackHubGoogleOnDeviceMeasurementInfoProvider?
+    /// Maximum time for the optional provider to enrich the first-open report.
+    /// Delivery continues fail-silent when the provider times out or returns nil.
+    public var googleOnDeviceMeasurementTimeout: TimeInterval = 3
     public var attributionChangedHandler: TrackHubAttributionChangedHandler?
     public var deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
     public var deliveryFailureHandler: TrackHubDeliveryFailureHandler?
@@ -100,6 +114,8 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
             "attConsentWaitingInterval=\(attConsentWaitingInterval), " +
             "firebaseAppInstanceId=\(firebaseAppInstanceId == nil ? "nil" : "<redacted>"), " +
             "googleOnDeviceMeasurementInfo=\(googleOnDeviceMeasurementInfo == nil ? "nil" : "<redacted>"), " +
+            "googleOnDeviceMeasurementInfoProvider=\(googleOnDeviceMeasurementInfoProvider != nil), " +
+            "googleOnDeviceMeasurementTimeout=\(googleOnDeviceMeasurementTimeout), " +
             "attributionChangedHandler=\(attributionChangedHandler != nil), " +
             "deferredDeepLinkHandler=\(deferredDeepLinkHandler != nil), " +
             "deliveryFailureHandler=\(deliveryFailureHandler != nil))"

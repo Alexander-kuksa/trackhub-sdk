@@ -14,6 +14,42 @@ same-device SDK update are not reliably distinguishable from that legacy mirror;
 3.0.3 intentionally preserves the previous restore behavior rather than risking
 a new identity on every update.
 
+## Optional Google integrated conversion measurement (3.0.4)
+
+SDK 3.0.4 can hold only outbound first-open delivery for a bounded interval
+while the host obtains Google's opaque `aggregateConversionInfo`. It does not
+block application startup, and all reports continue entering the durable queue.
+Timeout, an unavailable region, or a nil result releases delivery without
+disabling measurement. SDK 3.0.3 remains supported by Daively's server-side
+late-attribution fallback.
+
+TrackHub intentionally does not link `GoogleAdsOnDeviceConversion`: Google
+publishes version compatibility constraints with Firebase, so embedding one
+version in the core SDK would recreate the third-party dependency conflict SDK
+3 removed. Add a version compatible with the host application's Firebase SDK,
+then provide this bridge before `start`:
+
+```swift
+import GoogleAdsOnDeviceConversion
+import TrackHub
+
+var config = TrackHubConfig(sdkKey: "<DAIVELY_SDK_KEY>")
+config.googleOnDeviceMeasurementInfoProvider = { firstOpenAt, completion in
+    ConversionManager.sharedInstance.setFirstLaunchTime(firstOpenAt)
+    ConversionManager.sharedInstance.fetchAggregateConversionInfo(for: .installation) {
+        info, error in
+        completion(error == nil ? info : nil)
+    }
+}
+TrackHub.start(config)
+```
+
+The provider runs on the main actor and must return immediately; invoke the
+completion asynchronously. It is called only before an unsent first open, only
+when no explicit or cached ODM value exists, and never after a persisted privacy
+stop. The default wait is three seconds and is capped at fifteen seconds via
+`googleOnDeviceMeasurementTimeout`. Host callbacks are not wrapped or swallowed.
+
 External billing identities are optional provider-scoped links:
 
 ```swift

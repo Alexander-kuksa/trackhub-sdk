@@ -73,6 +73,7 @@ final class TrackHubTests: XCTestCase {
         var config = TrackHubConfig(sdkKey: sdkKey, environment: .testLab(token: testToken))
         config.firebaseAppInstanceId = firebaseId
         config.googleOnDeviceMeasurementInfo = "odm-sensitive-payload"
+        config.googleOnDeviceMeasurementInfoProvider = { _, completion in completion(nil) }
 
         let rendered = config.description
         XCTAssertFalse(rendered.contains(sdkKey))
@@ -81,6 +82,43 @@ final class TrackHubTests: XCTestCase {
         XCTAssertFalse(rendered.contains("odm-sensitive-payload"))
         XCTAssertTrue(rendered.contains("sdkKey=<redacted>"))
         XCTAssertTrue(rendered.contains("testLab(<redacted>)"))
+        XCTAssertTrue(rendered.contains("googleOnDeviceMeasurementInfoProvider=true"))
+    }
+
+    func testGoogleOnDeviceMeasurementWaitIsBoundedAndOnlyRunsBeforeFirstOpen() {
+        XCTAssertEqual(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(-1), 0)
+        XCTAssertEqual(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(.infinity), 0)
+        XCTAssertEqual(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(3), 3)
+        XCTAssertEqual(TrackHub.normalizedGoogleOnDeviceMeasurementWaitingInterval(60), 15)
+
+        XCTAssertTrue(TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+            hasProvider: true,
+            hasExplicitInfo: false,
+            hasCachedInfo: false,
+            installAlreadySent: false,
+            privacyStopped: false
+        ))
+        XCTAssertFalse(TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+            hasProvider: true,
+            hasExplicitInfo: false,
+            hasCachedInfo: false,
+            installAlreadySent: true,
+            privacyStopped: false
+        ))
+        XCTAssertFalse(TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+            hasProvider: true,
+            hasExplicitInfo: true,
+            hasCachedInfo: false,
+            installAlreadySent: false,
+            privacyStopped: false
+        ))
+        XCTAssertFalse(TrackHub.shouldFetchGoogleOnDeviceMeasurementInfo(
+            hasProvider: true,
+            hasExplicitInfo: false,
+            hasCachedInfo: false,
+            installAlreadySent: false,
+            privacyStopped: true
+        ))
     }
 
     func testRetryIsBoundedAndClockSkewRequiresTheExplicitServerError() throws {
@@ -168,6 +206,29 @@ final class TrackHubTests: XCTestCase {
         XCTAssertEqual(queue.nextForDelivery?.id, install.id)
         XCTAssertTrue(queue.remove(id: install.id))
         XCTAssertEqual(queue.nextForDelivery?.id, identity.id)
+    }
+
+    func testFirstSessionBufferedByConsentWaitCannotPassTheInstallAnchor() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("trackhub-first-open-ordering-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = EventQueue(url: directory.appendingPathComponent("queue.json"))
+        let session = PendingReport(path: "sdk/session", body: Data("{}".utf8), kind: "session")
+        let event = PendingReport(path: "sdk/track", body: Data("{}".utf8), kind: "event")
+        let install = PendingReport(
+            path: "install",
+            body: Data("{}".utf8),
+            kind: "production_install",
+            dedupeKey: "install"
+        )
+        XCTAssertNotNil(queue.enqueue(session))
+        XCTAssertNotNil(queue.enqueue(event))
+        XCTAssertNotNil(queue.enqueue(install))
+
+        XCTAssertEqual(queue.nextForDelivery?.id, install.id)
+        XCTAssertTrue(queue.remove(id: install.id))
+        XCTAssertEqual(queue.nextForDelivery?.id, session.id)
     }
 
     func testRuntimeCircuitIsProcessLocalAndResettableForTests() {

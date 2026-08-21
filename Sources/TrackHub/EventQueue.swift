@@ -112,14 +112,13 @@ import Foundation
 
     public var count: Int { items.count }
 
-    /// Preserve FIFO delivery except for the SDK 3.0.0 identity/install
-    /// ordering defect. A persisted external identity cannot be accepted by
-    /// the server before the installation exists, so let the one-shot install
-    /// anchor pass it without reordering any unrelated analytics traffic.
-    var nextForDelivery: PendingReport? {
-        guard let first = items.first else { return nil }
-        guard first.kind == "external_identity" else { return first }
-        return items.first(where: { $0.kind == "production_install" }) ?? first
+    /// Preserve FIFO delivery after the one-shot install anchor. ATT/ODM waits
+    /// can buffer a session before the install body is finalized, and an
+    /// upgraded legacy queue can begin with identity traffic. The server must
+    /// see the installation before either, so an undelivered production install
+    /// always goes first; all remaining reports keep their original order.
+    @_spi(Testing) public var nextForDelivery: PendingReport? {
+        items.first(where: { $0.kind == "production_install" }) ?? items.first
     }
 
     /// Returns the accepted report id, or nil when serialization/storage limits

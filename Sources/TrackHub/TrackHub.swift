@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.0.3"
+    public static let sdkVersion = "3.0.4"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -109,6 +109,8 @@ public enum TrackHub {
     private static var trackingDisabled = false
     private static var attConsentDelayActive = false
     private static var attConsentDelayWorkItem: DispatchWorkItem?
+    private static var odmInfoDelayToken: UUID?
+    private static var odmInfoDelayWorkItem: DispatchWorkItem?
     #if os(iOS)
     private static var lifecycleObserver: LifecycleObserver?
     #endif
@@ -181,6 +183,7 @@ public enum TrackHub {
     private static let runtimeCircuitMarkerKey = "trackhub.runtime_circuit.last_run.v1"
     private static let iso8601 = ISO8601DateFormatter()
     private static let callbackTimeout: TimeInterval = 15
+    private static let maxOdmInfoWaitingInterval: TimeInterval = 15
     private static let maxReportBytes = EventQueue.defaultMaxItemBytes
     private static let retryBaseInterval: TimeInterval = 1
     private static let retryMaxInterval: TimeInterval = 5 * 60
@@ -220,6 +223,23 @@ public enum TrackHub {
             print("[TrackHub] refusing non-HTTPS endpoint \(endpoint) — SDK not started")
             return
         }
+        let explicitOdmInfo = boundedOdmInfo(configuration.googleOnDeviceMeasurementInfo)
+        let cachedOdmInfo = boundedOdmInfo(UserDefaults.standard.string(forKey: odmInfoKey))
+        let provider = configuration.googleOnDeviceMeasurementInfoProvider
+        let shouldFetchOdmInfo = shouldFetchGoogleOnDeviceMeasurementInfo(
+            hasProvider: provider != nil,
+            hasExplicitInfo: explicitOdmInfo != nil,
+            hasCachedInfo: cachedOdmInfo != nil,
+            installAlreadySent: UserDefaults.standard.bool(forKey: installSentKey),
+            privacyStopped: isPrivacyStopRequested()
+                || UserDefaults.standard.bool(forKey: privacyDisabledKey)
+                || hasPendingErasureState()
+        )
+        let odmFetchToken = shouldFetchOdmInfo ? UUID() : nil
+        // Do not recreate measurement state merely because start() was called
+        // after a durable privacy stop. The value is consumed only when the
+        // provider is actually eligible to run.
+        let firstOpenAt = shouldFetchOdmInfo ? resolveFirstOpenAt() : Date()
         let applyConfiguration: (String?) -> Void = { capturedIdfv in
           queue.async {
             identifierForVendorSnapshot = capturedIdfv
@@ -299,10 +319,13 @@ public enum TrackHub {
             if let aii = configuration.firebaseAppInstanceId, !aii.isEmpty {
                 UserDefaults.standard.set(aii, forKey: appInstanceIdKey)
             }
-            if let info = boundedOdmInfo(configuration.googleOnDeviceMeasurementInfo) {
+            if let info = explicitOdmInfo {
                 UserDefaults.standard.set(info, forKey: odmInfoKey)
             }
-            _ = resolveFirstOpenAt()
+            startGoogleOnDeviceMeasurementDelayIfNeeded(
+                token: odmFetchToken,
+                waitingInterval: configuration.googleOnDeviceMeasurementTimeout
+            )
             schema = loadCachedSchema()
             sessionTracker = sessionTracker ?? SessionTracker()
             // Test Lab reports must never drain the production offline queue.
@@ -335,6 +358,19 @@ public enum TrackHub {
         #else
         applyConfiguration(nil)
         #endif
+        if let provider, let odmFetchToken {
+            // start(_:) is @MainActor, so provider SDKs with main-thread APIs
+            // can be called without dispatching or blocking the host UI.
+            provider(firstOpenAt) { info in
+                queue.async {
+                    finishGoogleOnDeviceMeasurementDelay(
+                        token: odmFetchToken,
+                        info: info,
+                        reason: info == nil ? "provider returned no info" : "provider completed"
+                    )
+                }
+            }
+        }
     }
 
     /// Forward the APNs registration token supplied by the host app. TrackHub
@@ -522,6 +558,72 @@ public enum TrackHub {
     ) -> TimeInterval {
         guard value.isFinite, value > 0 else { return 0 }
         return min(value, 360)
+    }
+
+    @_spi(Testing) public static func normalizedGoogleOnDeviceMeasurementWaitingInterval(
+        _ value: TimeInterval
+    ) -> TimeInterval {
+        guard value.isFinite, value > 0 else { return 0 }
+        return min(value, maxOdmInfoWaitingInterval)
+    }
+
+    @_spi(Testing) public static func shouldFetchGoogleOnDeviceMeasurementInfo(
+        hasProvider: Bool,
+        hasExplicitInfo: Bool,
+        hasCachedInfo: Bool,
+        installAlreadySent: Bool,
+        privacyStopped: Bool
+    ) -> Bool {
+        hasProvider && !hasExplicitInfo && !hasCachedInfo && !installAlreadySent && !privacyStopped
+    }
+
+    private static var firstOpenDeliveryDelayActive: Bool {
+        attConsentDelayActive || odmInfoDelayToken != nil
+    }
+
+    // On `queue`. Only delivery is delayed: public APIs remain non-blocking and
+    // their reports continue entering the existing durable queue.
+    private static func startGoogleOnDeviceMeasurementDelayIfNeeded(
+        token: UUID?,
+        waitingInterval: TimeInterval
+    ) {
+        odmInfoDelayWorkItem?.cancel()
+        odmInfoDelayWorkItem = nil
+        odmInfoDelayToken = nil
+        guard let token else { return }
+        let interval = normalizedGoogleOnDeviceMeasurementWaitingInterval(waitingInterval)
+        guard interval > 0 else { return }
+        odmInfoDelayToken = token
+        let workItem = DispatchWorkItem {
+            finishGoogleOnDeviceMeasurementDelay(
+                token: token,
+                info: nil,
+                reason: "timeout after \(Int(interval))s"
+            )
+        }
+        odmInfoDelayWorkItem = workItem
+        queue.asyncAfter(deadline: .now() + interval, execute: workItem)
+        log("first-open delivery waiting up to \(Int(interval))s for Google ODM")
+    }
+
+    // On `queue`. Idempotent: provider completion and timeout may race safely.
+    private static func finishGoogleOnDeviceMeasurementDelay(
+        token: UUID,
+        info: String?,
+        reason: String
+    ) {
+        guard odmInfoDelayToken == token else { return }
+        if let value = boundedOdmInfo(info) {
+            UserDefaults.standard.set(value, forKey: odmInfoKey)
+            // Replace the buffered install body at the same durable queue
+            // position before delivery is released.
+            reportInstallIfNeeded()
+        }
+        odmInfoDelayToken = nil
+        odmInfoDelayWorkItem?.cancel()
+        odmInfoDelayWorkItem = nil
+        log("first-open Google ODM wait ended (\(reason))")
+        flush()
     }
 
     @_spi(Testing) public static func shouldDelayFirstSessionForATT(
@@ -749,11 +851,18 @@ public enum TrackHub {
     }
 
     @_spi(Testing) public static func parseOpenAiOppref(from url: URL) -> String? {
-        let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-            .queryItems?
-            .first(where: { $0.name == "oppref" })?
-            .value?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // `oppref` is an opaque OpenAI capability. URLComponents.queryItems
+        // percent-decodes values, so read the percent-encoded query directly
+        // and preserve the exact value that arrived in the deep link.
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery
+        let value = query?
+            .split(separator: "&", omittingEmptySubsequences: false)
+            .compactMap { item -> String? in
+                guard let separator = item.firstIndex(of: "=") else { return nil }
+                guard item[..<separator] == "oppref" else { return nil }
+                return String(item[item.index(after: separator)...])
+            }
+            .first
         guard let value, !value.isEmpty, value.count <= 1024 else { return nil }
         return value
     }
@@ -1656,6 +1765,9 @@ public enum TrackHub {
         retryWorkItem = nil
         retryDeadline = nil
         transientRetryNotBefore = nil
+        odmInfoDelayWorkItem?.cancel()
+        odmInfoDelayWorkItem = nil
+        odmInfoDelayToken = nil
         deliveryCompletions.removeAll()
         currentAttributionSnapshot = nil
         attributionFetchInFlight = false
@@ -1970,8 +2082,8 @@ public enum TrackHub {
         let liveReportIDs = Set(targetQueue.items.map(\.id))
         deliveryCompletions = deliveryCompletions.filter { liveReportIDs.contains($0.key) }
         if let completion { deliveryCompletions[reportID] = completion }
-        if attConsentDelayActive {
-            log("\(path) buffered during first-session ATT wait")
+        if firstOpenDeliveryDelayActive {
+            log("\(path) buffered during first-open enrichment wait")
             return true
         }
         flush()
@@ -1982,7 +2094,7 @@ public enum TrackHub {
     // a stale timestamp never rejects buffered traffic.
     private static func flush() {
         guard !trackingDisabled, !isRuntimeCircuitOpen() else { return }
-        guard !attConsentDelayActive else { return }
+        guard !firstOpenDeliveryDelayActive else { return }
         guard !deliveryInFlight else { return }
         guard let targetQueue = eventQueue else { return }
         guard targetQueue.prepareForDelivery() else {
