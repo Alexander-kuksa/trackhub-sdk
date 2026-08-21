@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.0.4"
+    public static let sdkVersion = "3.0.5"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -154,6 +154,7 @@ public enum TrackHub {
     private static let wbraidKey = "trackhub.wbraid"
     private static let pendingGclidKey = "trackhub.pending_gclid"
     private static let pendingGbraidKey = "trackhub.pending_gbraid"
+    private static let pendingWbraidKey = "trackhub.pending_wbraid"
     private static let openAiOpprefKey = "trackhub.openai_oppref"
     private static let pendingOpenAiOpprefKey = "trackhub.pending_openai_oppref"
     private static let appInstanceIdKey = "trackhub.app_instance_id"
@@ -755,27 +756,48 @@ public enum TrackHub {
     }
 
     /// Record Google click identifiers captured from an app/universal link.
-    /// `gclid` and `gbraid` are attached to the corresponding session_start;
+    /// `gclid`, `gbraid`, and `wbraid` are attached to the corresponding session_start;
     /// install-time values also ride the one-shot install report. `wbraid` is
     /// retained for the separate web/offline conversion contour.
     public static func setGoogleClickIds(gclid: String? = nil, gbraid: String? = nil, wbraid: String? = nil) {
         guard !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         storeGoogleClickIds(gclid: gclid, gbraid: gbraid, wbraid: wbraid)
-        if gclid?.isEmpty == false || gbraid?.isEmpty == false {
+        if !sessionGoogleClickIds(gclid: gclid, gbraid: gbraid, wbraid: wbraid).isEmpty {
             queue.async {
                 if config != nil { handleForeground(force: true) }
             }
         }
     }
 
-    private static func storeGoogleClickIds(gclid: String?, gbraid: String?, wbraid: String?) {
+    @_spi(Testing) public static func storeGoogleClickIds(
+        gclid: String?,
+        gbraid: String?,
+        wbraid: String?
+    ) {
         if let c = gclid, !c.isEmpty {
             UserDefaults.standard.set(c, forKey: gclidKey)
             UserDefaults.standard.set(c, forKey: pendingGclidKey)
         }
         if let g = gbraid, !g.isEmpty { UserDefaults.standard.set(g, forKey: gbraidKey) }
         if let g = gbraid, !g.isEmpty { UserDefaults.standard.set(g, forKey: pendingGbraidKey) }
-        if let w = wbraid, !w.isEmpty { UserDefaults.standard.set(w, forKey: wbraidKey) }
+        if let w = wbraid, !w.isEmpty {
+            UserDefaults.standard.set(w, forKey: wbraidKey)
+            UserDefaults.standard.set(w, forKey: pendingWbraidKey)
+        }
+    }
+
+    /// The exact Google click references that belong on a session payload.
+    /// Kept pure so the one-shot wire contract is covered without network I/O.
+    @_spi(Testing) public static func sessionGoogleClickIds(
+        gclid: String?,
+        gbraid: String?,
+        wbraid: String?
+    ) -> [String: String] {
+        var result: [String: String] = [:]
+        if let gclid, !gclid.isEmpty { result["gclid"] = gclid }
+        if let gbraid, !gbraid.isEmpty { result["gbraid"] = gbraid }
+        if let wbraid, !wbraid.isEmpty { result["wbraid"] = wbraid }
+        return result
     }
 
     /// Captures supported ad click references from a deep/universal link:
@@ -794,7 +816,10 @@ public enum TrackHub {
         let defaults = UserDefaults.standard
         let hasGoogleReference = ids.gclid != nil || ids.gbraid != nil || ids.wbraid != nil
         if oppref != nil && !hasGoogleReference {
-            for key in [gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey] {
+            for key in [
+                gclidKey, gbraidKey, wbraidKey,
+                pendingGclidKey, pendingGbraidKey, pendingWbraidKey,
+            ] {
                 defaults.removeObject(forKey: key)
             }
         } else if hasGoogleReference && oppref == nil {
@@ -805,7 +830,11 @@ public enum TrackHub {
             defaults.set(oppref, forKey: openAiOpprefKey)
             defaults.set(oppref, forKey: pendingOpenAiOpprefKey)
         }
-        if ids.gclid != nil || ids.gbraid != nil || oppref != nil {
+        if !sessionGoogleClickIds(
+            gclid: ids.gclid,
+            gbraid: ids.gbraid,
+            wbraid: ids.wbraid
+        ).isEmpty || oppref != nil {
             queue.async {
                 if config != nil { handleForeground(force: true) }
             }
@@ -1184,8 +1213,13 @@ public enum TrackHub {
         if let country = currentCountryCode() { body["country"] = country }
         if let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String { body["app_version"] = v }
         let defaults = UserDefaults.standard
-        if let gclid = defaults.string(forKey: pendingGclidKey) { body["gclid"] = gclid }
-        if let gbraid = defaults.string(forKey: pendingGbraidKey) { body["gbraid"] = gbraid }
+        for (key, value) in sessionGoogleClickIds(
+            gclid: defaults.string(forKey: pendingGclidKey),
+            gbraid: defaults.string(forKey: pendingGbraidKey),
+            wbraid: defaults.string(forKey: pendingWbraidKey)
+        ) {
+            body[key] = value
+        }
         if let oppref = defaults.string(forKey: pendingOpenAiOpprefKey) {
             body["oppref"] = oppref
         }
@@ -1200,6 +1234,7 @@ public enum TrackHub {
             // queue must not turn an enqueue failure into permanent loss.
             defaults.removeObject(forKey: pendingGclidKey)
             defaults.removeObject(forKey: pendingGbraidKey)
+            defaults.removeObject(forKey: pendingWbraidKey)
             defaults.removeObject(forKey: pendingOpenAiOpprefKey)
         }
     }
@@ -1778,7 +1813,8 @@ public enum TrackHub {
         purgeAllOfflineQueueFiles()
         for key in [
             pushTokenKey, pushEnvironmentKey, deviceIdKey,
-            gclidKey, gbraidKey, wbraidKey, pendingGclidKey, pendingGbraidKey,
+            gclidKey, gbraidKey, wbraidKey,
+            pendingGclidKey, pendingGbraidKey, pendingWbraidKey,
             openAiOpprefKey, pendingOpenAiOpprefKey, appInstanceIdKey, odmInfoKey,
             adUserDataKey, adPersonalizationKey, eeaKey,
             piplConsentKey, crossBorderTransferConsentKey, adsMeasurementConsentKey,
