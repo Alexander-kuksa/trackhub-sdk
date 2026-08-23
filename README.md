@@ -5,7 +5,7 @@ foreground sessions, product engagement, attribution links and Apple
 conversion-value reporting. It does not depend on Apphud, RevenueCat or another
 billing SDK.
 
-Current release: `3.0.5` · Requirements: iOS 15+, Swift Package Manager
+Current release: `3.0.6` · Requirements: iOS 15+, Swift Package Manager
 
 ## Installation
 
@@ -15,7 +15,7 @@ Add the package in Xcode:
 https://github.com/Alexander-kuksa/trackhub-sdk
 ```
 
-Select `3.0.5` or a compatible `3.x` version, then start the SDK with the key
+Select `3.0.6` or a compatible `3.x` version, then start the SDK with the key
 from Daively → App → Setup:
 
 ```swift
@@ -29,6 +29,11 @@ TrackHub.start(config)
 The SDK key is a credential. Do not log it or include it in URLs, analytics or
 crash reports. Startup, disk access and delivery are asynchronous and do not
 need to gate the application's UI.
+
+Version 3.0.6 persists both the installation ID and Google `firstOpenAt`
+timestamp to direct durable storage before either can enter a report. If that
+storage boundary is unavailable, measurement fails silent for the process;
+application startup and privacy erasure remain available.
 
 ## Events and attribution
 

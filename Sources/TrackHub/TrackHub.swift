@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.0.5"
+    public static let sdkVersion = "3.0.6"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -1825,6 +1825,9 @@ public enum TrackHub {
         ] {
             UserDefaults.standard.removeObject(forKey: key)
         }
+        if !FirstOpenStore.remove(legacyKey: firstOpenAtKey) {
+            log("first-open timestamp file could not be removed")
+        }
         purgeRetiredMeasurementGeographyState()
         UserDefaults.standard.dictionaryRepresentation().keys
             .filter {
@@ -2323,14 +2326,12 @@ public enum TrackHub {
     // request starts, so session/purchase reports remain valid even if they
     // reach the server before the install report.
     private static func resolveFirstOpenAt() -> Date {
-        let defaults = UserDefaults.standard
-        if let stored = defaults.string(forKey: firstOpenAtKey),
-           let date = iso8601.date(from: stored) {
-            return date
+        let resolution = FirstOpenStore.resolve(legacyKey: firstOpenAtKey)
+        if !resolution.isDurable {
+            openRuntimeCircuit(.storage, detail: "first-open timestamp persistence failed")
+            log("first-open timestamp is not durable — measurement disabled for this process")
         }
-        let date = Date()
-        defaults.set(iso8601.string(from: date), forKey: firstOpenAtKey)
-        return date
+        return resolution.value
     }
 
     @_spi(Testing) public static func normalizedCountryCode(_ raw: String?) -> String? {
