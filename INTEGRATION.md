@@ -14,6 +14,13 @@ same-device SDK update are not reliably distinguishable from that legacy mirror;
 3.0.3 intentionally preserves the previous restore behavior rather than risking
 a new identity on every update.
 
+Version 3.0.6 gives `firstOpenAt` the same crash-safe boundary. It migrates the
+existing 3.0.0–3.0.5 `UserDefaults` value once, then uses an atomic,
+backup-excluded protected file as the source of truth. A hard kill after the
+first report can no longer regenerate Google's `fot`. If the timestamp cannot
+be persisted, the process-local storage circuit stops measurement without
+blocking or crashing the host application; the next launch retries.
+
 ## Optional Google integrated conversion measurement (3.0.4+)
 
 SDK 3.0.4 can hold only outbound first-open delivery for a bounded interval
