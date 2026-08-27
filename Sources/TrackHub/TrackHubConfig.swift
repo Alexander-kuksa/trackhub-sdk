@@ -76,11 +76,16 @@ public typealias TrackHubGoogleOnDeviceMeasurementInfoProvider = @MainActor @Sen
 ) -> Void
 
 public struct TrackHubConfig: Sendable, CustomStringConvertible {
+    /// A bounded delivery hold gives the host's contextual ATT flow time to
+    /// resolve before the one-shot first-open report leaves the device. Public
+    /// APIs and the app UI remain asynchronous and are never blocked.
+    public static let defaultATTConsentWaitingInterval: TimeInterval = 120
+
     public let sdkKey: String
     public let environment: TrackHubEnvironment
     public var debugLogging = false
     public var countryCode: String?
-    public var attConsentWaitingInterval: TimeInterval = 0
+    public var attConsentWaitingInterval: TimeInterval = Self.defaultATTConsentWaitingInterval
     public var googleAdsConsent = TrackHubGoogleAdsConsent()
     public var piplConsent = TrackHubPIPLConsent()
     public var firebaseAppInstanceId: String?
@@ -88,7 +93,7 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public var googleOnDeviceMeasurementInfoProvider: TrackHubGoogleOnDeviceMeasurementInfoProvider?
     /// Maximum time for the optional provider to enrich the first-open report.
     /// Delivery continues fail-silent when the provider times out or returns nil.
-    public var googleOnDeviceMeasurementTimeout: TimeInterval = 3
+    public var googleOnDeviceMeasurementTimeout: TimeInterval = 5
     public var attributionChangedHandler: TrackHubAttributionChangedHandler?
     public var deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
     public var deliveryFailureHandler: TrackHubDeliveryFailureHandler?

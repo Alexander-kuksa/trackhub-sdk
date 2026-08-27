@@ -1,0 +1,42 @@
+import Foundation
+import TrackHub
+
+#if os(iOS)
+import GoogleAdsOnDeviceConversion
+#endif
+
+/// Optional official Google On-Device Measurement bridge for TrackHub.
+///
+/// Select the `TrackHubGoogleODM` package product and call `start` instead of
+/// `TrackHub.start`. The bridge uses TrackHub's durable `firstOpenAt`, fetches
+/// Google's opaque installation signal asynchronously, and lets TrackHub's
+/// bounded fail-silent timer release delivery on nil/error/timeout.
+public enum TrackHubGoogleODM {
+    @MainActor
+    public static func start(_ configuration: TrackHubConfig) {
+        var enriched = configuration
+        if enriched.googleOnDeviceMeasurementInfoProvider == nil,
+           enriched.googleOnDeviceMeasurementInfo == nil {
+            enriched.googleOnDeviceMeasurementInfoProvider = provider
+        }
+        TrackHub.start(enriched)
+    }
+
+    public static let provider: TrackHubGoogleOnDeviceMeasurementInfoProvider = {
+        firstOpenAt,
+        completion in
+        #if os(iOS)
+        let manager = ConversionManager.sharedInstance
+        manager.setFirstLaunchTime(firstOpenAt)
+        manager.fetchAggregateConversionInfo(for: .installation) { info, error in
+            guard error == nil, let info, !info.isEmpty else {
+                completion(nil)
+                return
+            }
+            completion(info)
+        }
+        #else
+        completion(nil)
+        #endif
+    }
+}

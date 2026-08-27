@@ -422,6 +422,25 @@ check(TrackHub.normalizedATTConsentWaitingInterval(90) == 90,
       "a valid ATT waiting interval is preserved")
 check(TrackHub.normalizedATTConsentWaitingInterval(999) == 360,
       "ATT waiting interval is capped at the Adjust-compatible 360 seconds")
+check(TrackHubConfig.defaultATTConsentWaitingInterval == 120,
+      "first-open delivery waits for ATT by default")
+let attFirstOpen = Date(timeIntervalSince1970: 1_000)
+check(
+    TrackHub.remainingATTConsentWaitingInterval(
+        waitingInterval: 120,
+        firstOpenAt: attFirstOpen,
+        now: Date(timeIntervalSince1970: 1_030)
+    ) == 90,
+    "ATT wait resumes from the original durable first-open deadline after a hard kill"
+)
+check(
+    TrackHub.remainingATTConsentWaitingInterval(
+        waitingInterval: 120,
+        firstOpenAt: attFirstOpen,
+        now: Date(timeIntervalSince1970: 1_121)
+    ) == 0,
+    "an expired ATT deadline is never restarted on a later launch"
+)
 check(
     TrackHub.shouldDelayFirstSessionForATT(
         waitingInterval: 120,

@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.0.6"
+    public static let sdkVersion = "3.1.0"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -550,15 +550,28 @@ public enum TrackHub {
         #endif
     }
 
-    /// Adjust-style bounded first-session wait. The value is deliberately
-    /// opt-in and capped at 360 seconds, matching Adjust's current ATT waiting
-    /// window. Only TrackHub's first install/session/event network delivery
+    /// Bounded first-session wait. It defaults to 120 seconds and is capped at
+    /// 360 seconds. Set it to zero only when the host intentionally does not
+    /// run an ATT flow. Only TrackHub's first install/session/event delivery
     /// waits for ATT or the timeout.
     @_spi(Testing) public static func normalizedATTConsentWaitingInterval(
         _ value: TimeInterval
     ) -> TimeInterval {
         guard value.isFinite, value > 0 else { return 0 }
         return min(value, 360)
+    }
+
+    /// Remaining process-independent ATT hold. The deadline is anchored to
+    /// the durable first-open timestamp, so repeated hard kills cannot restart
+    /// a fresh 120-second wait forever.
+    @_spi(Testing) public static func remainingATTConsentWaitingInterval(
+        waitingInterval: TimeInterval,
+        firstOpenAt: Date,
+        now: Date
+    ) -> TimeInterval {
+        let bounded = normalizedATTConsentWaitingInterval(waitingInterval)
+        guard bounded > 0 else { return 0 }
+        return min(bounded, max(0, firstOpenAt.addingTimeInterval(bounded).timeIntervalSince(now)))
     }
 
     @_spi(Testing) public static func normalizedGoogleOnDeviceMeasurementWaitingInterval(
@@ -657,7 +670,14 @@ public enum TrackHub {
             integrationTest: config.integrationTestToken != nil
         ) else { return }
 
-        let interval = config.attConsentWaitingInterval
+        let interval = remainingATTConsentWaitingInterval(
+            waitingInterval: config.attConsentWaitingInterval,
+            firstOpenAt: resolveFirstOpenAt(),
+            now: Date()
+        )
+        guard interval > 0 else {
+            return log("first-session ATT wait deadline already elapsed")
+        }
         attConsentDelayActive = true
         let workItem = DispatchWorkItem {
             finishATTConsentDelay(reason: "timeout after \(Int(interval))s")
