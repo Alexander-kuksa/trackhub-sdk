@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.1.0"
+    public static let sdkVersion = "3.1.1"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -109,6 +109,11 @@ public enum TrackHub {
     private static var trackingDisabled = false
     private static var attConsentDelayActive = false
     private static var attConsentDelayWorkItem: DispatchWorkItem?
+    // The fetch generation outlives the five-second delivery hold. Google may
+    // complete later while the independent ATT hold is still active; that
+    // valid value must still enrich the buffered install (or, after delivery,
+    // be retained for downstream conversions).
+    private static var odmInfoFetchGeneration: UUID?
     private static var odmInfoDelayToken: UUID?
     private static var odmInfoDelayWorkItem: DispatchWorkItem?
     #if os(iOS)
@@ -236,11 +241,15 @@ public enum TrackHub {
                 || UserDefaults.standard.bool(forKey: privacyDisabledKey)
                 || hasPendingErasureState()
         )
-        let odmFetchToken = shouldFetchOdmInfo ? UUID() : nil
+        let requestedOdmFetchToken = shouldFetchOdmInfo ? UUID() : nil
         // Do not recreate measurement state merely because start() was called
         // after a durable privacy stop. The value is consumed only when the
         // provider is actually eligible to run.
         let firstOpenAt = shouldFetchOdmInfo ? resolveFirstOpenAt() : Date()
+        // A failed durable first-open write opens the process-local storage
+        // circuit. Do not invoke a third-party binary after measurement has
+        // been disabled for this process.
+        let odmFetchToken = isRuntimeCircuitOpen() ? nil : requestedOdmFetchToken
         let applyConfiguration: (String?) -> Void = { capturedIdfv in
           queue.async {
             identifierForVendorSnapshot = capturedIdfv
@@ -364,10 +373,9 @@ public enum TrackHub {
             // can be called without dispatching or blocking the host UI.
             provider(firstOpenAt) { info in
                 queue.async {
-                    finishGoogleOnDeviceMeasurementDelay(
+                    completeGoogleOnDeviceMeasurementFetch(
                         token: odmFetchToken,
-                        info: info,
-                        reason: info == nil ? "provider returned no info" : "provider completed"
+                        info: info
                     )
                 }
             }
@@ -604,40 +612,72 @@ public enum TrackHub {
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
         odmInfoDelayToken = nil
+        odmInfoFetchGeneration = token
         guard let token else { return }
         let interval = normalizedGoogleOnDeviceMeasurementWaitingInterval(waitingInterval)
         guard interval > 0 else { return }
         odmInfoDelayToken = token
         let workItem = DispatchWorkItem {
-            finishGoogleOnDeviceMeasurementDelay(
-                token: token,
-                info: nil,
-                reason: "timeout after \(Int(interval))s"
-            )
+            expireGoogleOnDeviceMeasurementDelay(token: token, interval: interval)
         }
         odmInfoDelayWorkItem = workItem
         queue.asyncAfter(deadline: .now() + interval, execute: workItem)
         log("first-open delivery waiting up to \(Int(interval))s for Google ODM")
     }
 
-    // On `queue`. Idempotent: provider completion and timeout may race safely.
-    private static func finishGoogleOnDeviceMeasurementDelay(
+    // On `queue`. The timeout releases delivery but deliberately keeps the
+    // fetch generation alive: a later provider callback can still enrich an
+    // install held by ATT and is useful for downstream conversions even when
+    // the first-open report has already left the device.
+    private static func expireGoogleOnDeviceMeasurementDelay(
         token: UUID,
-        info: String?,
-        reason: String
+        interval: TimeInterval
     ) {
         guard odmInfoDelayToken == token else { return }
-        if let value = boundedOdmInfo(info) {
-            UserDefaults.standard.set(value, forKey: odmInfoKey)
-            // Replace the buffered install body at the same durable queue
-            // position before delivery is released.
-            reportInstallIfNeeded()
-        }
         odmInfoDelayToken = nil
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
-        log("first-open Google ODM wait ended (\(reason))")
+        log("first-open Google ODM wait ended (timeout after \(Int(interval))s)")
         flush()
+    }
+
+    // On `queue`. A stale generation, privacy erasure or runtime circuit makes
+    // the callback inert. Provider completion and timeout may race safely.
+    private static func completeGoogleOnDeviceMeasurementFetch(
+        token: UUID,
+        info: String?
+    ) {
+        guard odmInfoFetchGeneration == token else { return }
+        odmInfoFetchGeneration = nil
+        let value = boundedOdmInfo(info)
+        if shouldAcceptGoogleOnDeviceMeasurementInfo(
+            hasMatchingGeneration: true,
+            privacyStopped: trackingDisabled || isPrivacyStopRequested(),
+            runtimeCircuitOpen: isRuntimeCircuitOpen(),
+            hasValidInfo: value != nil
+        ), let value {
+            UserDefaults.standard.set(value, forKey: odmInfoKey)
+            // Replace a still-buffered install body at the same durable queue
+            // position. If first_open already left after the ODM timeout, the
+            // cached value remains available to downstream conversions.
+            reportInstallIfNeeded()
+        }
+        if odmInfoDelayToken == token {
+            odmInfoDelayToken = nil
+            odmInfoDelayWorkItem?.cancel()
+            odmInfoDelayWorkItem = nil
+        }
+        log("first-open Google ODM provider completed (\(value == nil ? "no info" : "info cached"))")
+        flush()
+    }
+
+    @_spi(Testing) public static func shouldAcceptGoogleOnDeviceMeasurementInfo(
+        hasMatchingGeneration: Bool,
+        privacyStopped: Bool,
+        runtimeCircuitOpen: Bool,
+        hasValidInfo: Bool
+    ) -> Bool {
+        hasMatchingGeneration && !privacyStopped && !runtimeCircuitOpen && hasValidInfo
     }
 
     @_spi(Testing) public static func shouldDelayFirstSessionForATT(
@@ -1823,6 +1863,7 @@ public enum TrackHub {
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
         odmInfoDelayToken = nil
+        odmInfoFetchGeneration = nil
         deliveryCompletions.removeAll()
         currentAttributionSnapshot = nil
         attributionFetchInFlight = false

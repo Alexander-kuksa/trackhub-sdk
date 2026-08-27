@@ -1,7 +1,7 @@
 import Foundation
 import TrackHub
 
-#if os(iOS)
+#if os(iOS) && !targetEnvironment(macCatalyst)
 import GoogleAdsOnDeviceConversion
 #endif
 
@@ -25,7 +25,7 @@ public enum TrackHubGoogleODM {
     public static let provider: TrackHubGoogleOnDeviceMeasurementInfoProvider = {
         firstOpenAt,
         completion in
-        #if os(iOS)
+        #if os(iOS) && !targetEnvironment(macCatalyst)
         let manager = ConversionManager.sharedInstance
         manager.setFirstLaunchTime(firstOpenAt)
         manager.fetchAggregateConversionInfo(for: .installation) { info, error in
