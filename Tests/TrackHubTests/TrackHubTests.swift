@@ -215,6 +215,101 @@ final class TrackHubTests: XCTestCase {
         ))
     }
 
+    func testGoogleOdmTimeoutLateCallbackRefreshesBufferedInstallUnlessPrivacyStopsIt() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("trackhub-odm-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let queue = EventQueue(url: directory.appendingPathComponent("queue.json"))
+        let initialInstall = PendingReport(
+            path: "install",
+            body: Data(#"{"install_uid":"one"}"#.utf8),
+            kind: "production_install",
+            dedupeKey: "install"
+        )
+        let session = PendingReport(
+            path: "sdk/session",
+            body: Data(#"{"session_uid":"session-one"}"#.utf8),
+            kind: "session"
+        )
+        XCTAssertNotNil(queue.enqueue(initialInstall))
+        XCTAssertNotNil(queue.enqueue(session))
+
+        var state = GoogleOdmDeliveryState()
+        let generation = UUID()
+        state.start(token: generation, delayDelivery: true)
+        XCTAssertTrue(state.deliveryDelayActive)
+
+        // The five-second timeout releases delivery but deliberately leaves
+        // the fetch generation alive.
+        XCTAssertTrue(state.expire(token: generation))
+        XCTAssertFalse(state.deliveryDelayActive)
+        let lateOutcome = state.complete(
+            token: generation,
+            privacyStopped: false,
+            runtimeCircuitOpen: false,
+            hasValidInfo: true
+        )
+        XCTAssertEqual(
+            lateOutcome,
+            .completed(cacheAndRefreshInstall: true, releasedDeliveryHold: false)
+        )
+
+        // This is the same dedupe replacement used by reportInstallIfNeeded:
+        // it preserves the durable install's identity/order while enriching
+        // its exact body before delivery.
+        if lateOutcome == .completed(cacheAndRefreshInstall: true, releasedDeliveryHold: false) {
+            let enrichedInstall = PendingReport(
+                path: "install",
+                body: Data(#"{"install_uid":"one","odm_info":"late-info"}"#.utf8),
+                kind: "production_install",
+                dedupeKey: "install"
+            )
+            XCTAssertEqual(queue.enqueue(enrichedInstall), initialInstall.id)
+        }
+        XCTAssertEqual(queue.count, 2)
+        XCTAssertEqual(queue.nextForDelivery?.id, initialInstall.id)
+        XCTAssertTrue(String(data: queue.nextForDelivery!.body, encoding: .utf8)!.contains("late-info"))
+
+        // A privacy stop consumes the matching callback but cannot refresh the
+        // queue. A subsequent stale callback also remains inert.
+        var privacyState = GoogleOdmDeliveryState()
+        let privacyGeneration = UUID()
+        privacyState.start(token: privacyGeneration, delayDelivery: true)
+        XCTAssertEqual(
+            privacyState.complete(
+                token: privacyGeneration,
+                privacyStopped: true,
+                runtimeCircuitOpen: false,
+                hasValidInfo: true
+            ),
+            .completed(cacheAndRefreshInstall: false, releasedDeliveryHold: true)
+        )
+        XCTAssertEqual(
+            privacyState.complete(
+                token: privacyGeneration,
+                privacyStopped: false,
+                runtimeCircuitOpen: false,
+                hasValidInfo: true
+            ),
+            .stale
+        )
+
+        var restartedState = GoogleOdmDeliveryState()
+        let oldGeneration = UUID()
+        restartedState.start(token: oldGeneration, delayDelivery: true)
+        restartedState.start(token: UUID(), delayDelivery: true)
+        XCTAssertEqual(
+            restartedState.complete(
+                token: oldGeneration,
+                privacyStopped: false,
+                runtimeCircuitOpen: false,
+                hasValidInfo: true
+            ),
+            .stale
+        )
+    }
+
     func testRetryIsBoundedAndClockSkewRequiresTheExplicitServerError() throws {
         XCTAssertEqual(TrackHub.retryDelay(attempt: 99, jitter: 1), 300)
         let response = try JSONSerialization.data(withJSONObject: [

@@ -113,8 +113,7 @@ public enum TrackHub {
     // complete later while the independent ATT hold is still active; that
     // valid value must still enrich the buffered install (or, after delivery,
     // be retained for downstream conversions).
-    private static var odmInfoFetchGeneration: UUID?
-    private static var odmInfoDelayToken: UUID?
+    private static var odmDeliveryState = GoogleOdmDeliveryState()
     private static var odmInfoDelayWorkItem: DispatchWorkItem?
     #if os(iOS)
     private static var lifecycleObserver: LifecycleObserver?
@@ -600,7 +599,7 @@ public enum TrackHub {
     }
 
     private static var firstOpenDeliveryDelayActive: Bool {
-        attConsentDelayActive || odmInfoDelayToken != nil
+        attConsentDelayActive || odmDeliveryState.deliveryDelayActive
     }
 
     // On `queue`. Only delivery is delayed: public APIs remain non-blocking and
@@ -611,12 +610,9 @@ public enum TrackHub {
     ) {
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
-        odmInfoDelayToken = nil
-        odmInfoFetchGeneration = token
-        guard let token else { return }
         let interval = normalizedGoogleOnDeviceMeasurementWaitingInterval(waitingInterval)
-        guard interval > 0 else { return }
-        odmInfoDelayToken = token
+        odmDeliveryState.start(token: token, delayDelivery: interval > 0)
+        guard let token, interval > 0 else { return }
         let workItem = DispatchWorkItem {
             expireGoogleOnDeviceMeasurementDelay(token: token, interval: interval)
         }
@@ -633,8 +629,7 @@ public enum TrackHub {
         token: UUID,
         interval: TimeInterval
     ) {
-        guard odmInfoDelayToken == token else { return }
-        odmInfoDelayToken = nil
+        guard odmDeliveryState.expire(token: token) else { return }
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
         log("first-open Google ODM wait ended (timeout after \(Int(interval))s)")
@@ -647,23 +642,24 @@ public enum TrackHub {
         token: UUID,
         info: String?
     ) {
-        guard odmInfoFetchGeneration == token else { return }
-        odmInfoFetchGeneration = nil
         let value = boundedOdmInfo(info)
-        if shouldAcceptGoogleOnDeviceMeasurementInfo(
-            hasMatchingGeneration: true,
+        let outcome = odmDeliveryState.complete(
+            token: token,
             privacyStopped: trackingDisabled || isPrivacyStopRequested(),
             runtimeCircuitOpen: isRuntimeCircuitOpen(),
             hasValidInfo: value != nil
-        ), let value {
+        )
+        guard case let .completed(cacheAndRefreshInstall, releasedDeliveryHold) = outcome else {
+            return
+        }
+        if cacheAndRefreshInstall, let value {
             UserDefaults.standard.set(value, forKey: odmInfoKey)
             // Replace a still-buffered install body at the same durable queue
             // position. If first_open already left after the ODM timeout, the
             // cached value remains available to downstream conversions.
             reportInstallIfNeeded()
         }
-        if odmInfoDelayToken == token {
-            odmInfoDelayToken = nil
+        if releasedDeliveryHold {
             odmInfoDelayWorkItem?.cancel()
             odmInfoDelayWorkItem = nil
         }
@@ -1862,8 +1858,7 @@ public enum TrackHub {
         transientRetryNotBefore = nil
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
-        odmInfoDelayToken = nil
-        odmInfoFetchGeneration = nil
+        odmDeliveryState.cancel()
         deliveryCompletions.removeAll()
         currentAttributionSnapshot = nil
         attributionFetchInFlight = false

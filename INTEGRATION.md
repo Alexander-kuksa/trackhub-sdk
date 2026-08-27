@@ -114,7 +114,7 @@ TrackHub.trackPurchaseCtaTapped(at: .onboarding)
 // placement is encoded as the canonical placement_name parameter.
 ```
 
-`attConsentWaitingInterval` defaults to 120 seconds in 3.1.0+. This delays only
+`attConsentWaitingInterval` defaults to 120 seconds in 3.1.1. This delays only
 outbound first-open delivery while ATT remains `.notDetermined`; it never blocks
 the UI or public SDK calls. Events are written to the offline queue during the
 wait. The deadline is anchored to the durable original `firstOpenAt`, so a hard
