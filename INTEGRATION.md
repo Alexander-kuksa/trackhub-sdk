@@ -1,4 +1,4 @@
-# TrackHub iOS 3.0 integration reference
+# TrackHub iOS 3.1 integration reference
 
 ## Contract
 
@@ -14,27 +14,39 @@ same-device SDK update are not reliably distinguishable from that legacy mirror;
 3.0.3 intentionally preserves the previous restore behavior rather than risking
 a new identity on every update.
 
-Version 3.0.6 gives `firstOpenAt` the same crash-safe boundary. It migrates the
+Version 3.0.6+ gives `firstOpenAt` the same crash-safe boundary. It migrates the
 existing 3.0.0–3.0.5 `UserDefaults` value once, then uses an atomic,
 backup-excluded protected file as the source of truth. A hard kill after the
 first report can no longer regenerate Google's `fot`. If the timestamp cannot
 be persisted, the process-local storage circuit stops measurement without
 blocking or crashing the host application; the next launch retries.
 
-## Optional Google integrated conversion measurement (3.0.4+)
+## Google integrated conversion measurement (3.1.0+)
 
-SDK 3.0.4 can hold only outbound first-open delivery for a bounded interval
-while the host obtains Google's opaque `aggregateConversionInfo`. It does not
-block application startup, and all reports continue entering the durable queue.
-Timeout, an unavailable region, or a nil result releases delivery without
-disabling measurement. SDK 3.0.3 remains supported by Daively's server-side
-late-attribution fallback.
+For iOS applications promoted by Google, select the `TrackHubGoogleODM` Swift
+package product. It adds Google's official On-Device Measurement runtime as an
+optional adapter while the provider-neutral `TrackHub` core stays independent:
 
-TrackHub intentionally does not link `GoogleAdsOnDeviceConversion`: Google
-publishes version compatibility constraints with Firebase, so embedding one
-version in the core SDK would recreate the third-party dependency conflict SDK
-3 removed. Add a version compatible with the host application's Firebase SDK,
-then provide this bridge before `start`:
+```swift
+import TrackHub
+import TrackHubGoogleODM
+
+var config = TrackHubConfig(sdkKey: "<DAIVELY_SDK_KEY>")
+TrackHubGoogleODM.start(config)
+```
+
+The adapter uses TrackHub's durable `firstOpenAt`, calls Google's official
+`ConversionManager`, and adds the returned opaque `odm_info` to the one-shot
+first-open report. It waits at most five seconds. A timeout, nil result,
+unsupported region, Google runtime error, or unavailable TrackHub server never
+blocks application startup and never disables measurement: reports enter the
+durable queue and delivery proceeds fail-silent.
+
+The package accepts Google ODM 2.x–3.x so SwiftPM can resolve a release compatible
+with Firebase or another analytics SDK already owned by the host application.
+The resolved version must still follow Google's published Firebase compatibility
+matrix. An application that deliberately manages Google ODM itself can select
+the core `TrackHub` product and provide the existing callback before `start`:
 
 ```swift
 import GoogleAdsOnDeviceConversion
@@ -51,11 +63,11 @@ config.googleOnDeviceMeasurementInfoProvider = { firstOpenAt, completion in
 TrackHub.start(config)
 ```
 
-The provider runs on the main actor and must return immediately; invoke the
-completion asynchronously. It is called only before an unsent first open, only
-when no explicit or cached ODM value exists, and never after a persisted privacy
-stop. The default wait is three seconds and is capped at fifteen seconds via
-`googleOnDeviceMeasurementTimeout`. Host callbacks are not wrapped or swallowed.
+The custom provider runs on the main actor and must return immediately; invoke
+the completion asynchronously. It is called only before an unsent first open,
+only when no explicit or cached ODM value exists, and never after a persisted
+privacy stop. The default wait is five seconds and is capped at fifteen seconds
+via `googleOnDeviceMeasurementTimeout`. Host callbacks are not wrapped.
 
 SDK 3.0.5 also treats `wbraid` as durable one-shot re-engagement evidence on
 existing installations. A `wbraid` captured by `setGoogleClickIds` or
@@ -66,15 +78,48 @@ web-to-app/Data Manager contour without replaying the one-shot install.
 External billing identities are optional provider-scoped links:
 
 ```swift
-var config = TrackHubConfig(sdkKey: "<TRACKHUB_SDK_KEY>")
-config.attConsentWaitingInterval = 120
-TrackHub.start(config)
+import TrackHub
+import TrackHubGoogleODM
+
+var config = TrackHubConfig(sdkKey: "<DAIVELY_SDK_KEY>")
+TrackHubGoogleODM.start(config)
+
+// Present your own contextual explanation first, while the app is active.
 TrackHub.requestAppTrackingTransparency()
 
 TrackHub.trackPaywallShown(at: .onboarding)
 TrackHub.trackPurchaseCtaTapped(at: .onboarding)
 // placement is encoded as the canonical placement_name parameter.
 ```
+
+`attConsentWaitingInterval` defaults to 120 seconds in 3.1.0. This delays only
+outbound first-open delivery while ATT remains `.notDetermined`; it never blocks
+the UI or public SDK calls. Events are written to the offline queue during the
+wait. The deadline is anchored to the durable original `firstOpenAt`, so a hard
+kill cannot restart another full 120-second wait. A resolved ATT result releases
+delivery immediately. If the host never requests ATT, the timeout releases the
+report without IDFA. Set the interval to `0` only when the app intentionally has
+no ATT flow. A truthful `NSUserTrackingUsageDescription` must be present in the
+host Info.plist; TrackHub intentionally never presents Apple's prompt by itself.
+
+### Coexisting with Singular while Daively owns conversion values
+
+For Daively-managed SKAN/AdAttributionKit conversion values, stop Singular from
+writing the same Apple state. Singular may still run independent analytics and
+its own Google ODM rail:
+
+```swift
+let singularConfig = SingularConfig(apiKey: "<SINGULAR_KEY>", andSecret: "<SINGULAR_SECRET>")
+singularConfig.manualSkanConversionManagement = true
+singularConfig.enableOdmWithTimeoutInterval = 5
+Singular.start(singularConfig)
+```
+
+Use one SwiftPM-resolved `GoogleAdsOnDeviceConversion` version compatible with
+the application's Firebase/Singular dependency graph. The manual-SKAN flag only
+chooses who writes Apple's conversion values; it does not disable Singular event
+reporting or ODM. Another application may choose another conversion-value owner,
+but exactly one SDK must write those values.
 
 ```swift
 TrackHub.setExternalIdentity(provider: "apphud", userId: Apphud.userID())
@@ -187,16 +232,20 @@ TrackHub.attribution { snapshot in
 
 ## Release checklist
 
-1. Resolve TrackHub 3.x and confirm the dependency graph contains no Apphud or RevenueCat through TrackHub.
-2. Start TrackHub with one SDK Key and link the chosen provider with one explicit call.
-3. Run a clean Test Lab installation; verify install precedes the first session.
-4. Verify foreground at 29:59 stays in-session and 30:01 starts a new session.
-5. Exercise provider anonymous ID, login ID, logout, and restore without changing `install_uid`.
-6. Complete an Apphud/RevenueCat sandbox purchase and verify the authenticated server event.
-7. If Apple verification is enabled, verify the reconciliation seed confirms; otherwise verify lower-trust money remains visible.
-8. Test offline queue, process restart, and exactly-once drain.
-9. Test `gdprForgetMe` offline and after relaunch.
-10. Confirm SDK Key, install credential and raw external identity are absent from logs/crash metadata.
+1. Resolve TrackHub 3.1.0+ and confirm the dependency graph contains no Apphud or RevenueCat through TrackHub.
+2. For Google-promoted iOS apps, select `TrackHubGoogleODM`, verify the resolved Google ODM/Firebase versions, and start through `TrackHubGoogleODM.start`.
+3. Add a truthful `NSUserTrackingUsageDescription`; present the host explanation and call `requestAppTrackingTransparency` while the app is active.
+4. If Singular coexists and Daively owns conversion values, set `manualSkanConversionManagement = true`; keep Singular ODM enabled when its external reporting is required.
+5. Forward cold-start and subsequent deep/universal links to `TrackHub.handleDeepLink` before `start` when the host already has the URL.
+6. Start with one SDK Key and link the chosen billing provider with one explicit `setExternalIdentity` call.
+7. Run a clean Test Lab installation; verify install precedes the first session and the first-open trace records whether IDFA and/or ODM was present.
+8. Verify foreground at 29:59 stays in-session and 30:01 starts a new session.
+9. Exercise provider anonymous ID, login ID, logout, and restore without changing `install_uid`.
+10. Complete an Apphud/RevenueCat sandbox purchase and verify the authenticated server event plus `trackPurchaseObserved` context.
+11. If Apple verification is enabled, verify reconciliation confirms; otherwise verify lower-trust money remains visible.
+12. Test offline queue, process restart during ATT/ODM wait, and exactly-once drain.
+13. Test `gdprForgetMe` offline and after relaunch.
+14. Confirm SDK Key, install credential and raw external identity are absent from logs/crash metadata.
 
 ## Upgrade from 2.x
 

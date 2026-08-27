@@ -3,6 +3,41 @@ import XCTest
 @testable @_spi(Testing) import TrackHub
 
 final class TrackHubTests: XCTestCase {
+    func testFirstOpenDeliveryDefaultsAreBoundedAndCrashStable() {
+        XCTAssertEqual(TrackHubConfig.defaultATTConsentWaitingInterval, 120)
+        XCTAssertEqual(
+            TrackHubConfig(sdkKey: "test").attConsentWaitingInterval,
+            TrackHubConfig.defaultATTConsentWaitingInterval
+        )
+        XCTAssertEqual(TrackHubConfig(sdkKey: "test").googleOnDeviceMeasurementTimeout, 5)
+
+        let firstOpen = Date(timeIntervalSince1970: 1_000)
+        XCTAssertEqual(
+            TrackHub.remainingATTConsentWaitingInterval(
+                waitingInterval: 120,
+                firstOpenAt: firstOpen,
+                now: Date(timeIntervalSince1970: 1_030)
+            ),
+            90
+        )
+        XCTAssertEqual(
+            TrackHub.remainingATTConsentWaitingInterval(
+                waitingInterval: 120,
+                firstOpenAt: firstOpen,
+                now: Date(timeIntervalSince1970: 1_121)
+            ),
+            0
+        )
+        XCTAssertEqual(
+            TrackHub.remainingATTConsentWaitingInterval(
+                waitingInterval: 0,
+                firstOpenAt: firstOpen,
+                now: firstOpen
+            ),
+            0
+        )
+    }
+
     func testGoogleAdsConsentIsOptionalAndDoesNotInferEitherSignal() {
         let consent = TrackHubGoogleAdsConsent()
         XCTAssertEqual(consent.adUserData, .unknown)

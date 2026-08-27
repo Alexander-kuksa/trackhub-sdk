@@ -20,3 +20,5 @@ jobs:
       - run: swift run encoder-tests
       - name: Compile for iOS Simulator
         run: xcodebuild -scheme TrackHub -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+      - name: Compile Google ODM adapter for iOS Simulator
+        run: xcodebuild -scheme TrackHubGoogleODM -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
