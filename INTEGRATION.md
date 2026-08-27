@@ -21,7 +21,7 @@ first report can no longer regenerate Google's `fot`. If the timestamp cannot
 be persisted, the process-local storage circuit stops measurement without
 blocking or crashing the host application; the next launch retries.
 
-## Google integrated conversion measurement (3.1.0+)
+## Google integrated conversion measurement (3.1.1+ recommended)
 
 For iOS applications promoted by Google, select the `TrackHubGoogleODM` Swift
 package product. It adds Google's official On-Device Measurement runtime as an
@@ -40,7 +40,10 @@ The adapter uses TrackHub's durable `firstOpenAt`, calls Google's official
 first-open report. It waits at most five seconds. A timeout, nil result,
 unsupported region, Google runtime error, or unavailable TrackHub server never
 blocks application startup and never disables measurement: reports enter the
-durable queue and delivery proceeds fail-silent.
+durable queue and delivery proceeds fail-silent. Version 3.1.1 also accepts and
+caches a valid provider result that arrives after the five-second delivery
+boundary. If ATT is still holding the first report, the buffered install is
+enriched; otherwise the value remains available to downstream conversions.
 
 The package accepts Google ODM 2.x–3.x so SwiftPM can resolve a release compatible
 with Firebase or another analytics SDK already owned by the host application.
@@ -69,6 +72,25 @@ only when no explicit or cached ODM value exists, and never after a persisted
 privacy stop. The default wait is five seconds and is capped at fifteen seconds
 via `googleOnDeviceMeasurementTimeout`. Host callbacks are not wrapped.
 
+Before shipping, inspect the final application dependency graph and archive:
+
+1. Keep exactly one `GoogleAdsOnDeviceConversion` package identity and one
+   linked binary. Remove deprecated `GoogleAppMeasurementOnDeviceConversion` /
+   `FirebaseAnalyticsOnDeviceConversion` frameworks.
+2. Do not mix the ODM runtime across SwiftPM, CocoaPods and a manually embedded
+   XCFramework. When Firebase is present, pin the ODM release from Google's
+   published GA4F compatibility matrix.
+3. With Singular, do not add a second ODM package through the app target if
+   Singular already resolves the same package identity. Use one resolved graph
+   and keep only one Daively start call.
+4. Run an actual-device cold-launch smoke test for Debug and Release/TestFlight.
+   A Swift `do/catch` cannot safely recover an Objective-C initialization
+   exception caused by duplicate incompatible ODM binaries.
+5. The ODM bridge is intentionally inert on Mac Catalyst; select the provider-
+   neutral `TrackHub` product for Catalyst targets.
+6. Review the host application's privacy disclosures for Google's temporary,
+   de-identified ODM signals.
+
 SDK 3.0.5 also treats `wbraid` as durable one-shot re-engagement evidence on
 existing installations. A `wbraid` captured by `setGoogleClickIds` or
 `handleDeepLink` forces a normal numbered session and remains pending until the
@@ -92,7 +114,7 @@ TrackHub.trackPurchaseCtaTapped(at: .onboarding)
 // placement is encoded as the canonical placement_name parameter.
 ```
 
-`attConsentWaitingInterval` defaults to 120 seconds in 3.1.0. This delays only
+`attConsentWaitingInterval` defaults to 120 seconds in 3.1.0+. This delays only
 outbound first-open delivery while ATT remains `.notDetermined`; it never blocks
 the UI or public SDK calls. Events are written to the offline queue during the
 wait. The deadline is anchored to the durable original `firstOpenAt`, so a hard
@@ -232,7 +254,7 @@ TrackHub.attribution { snapshot in
 
 ## Release checklist
 
-1. Resolve TrackHub 3.1.0+ and confirm the dependency graph contains no Apphud or RevenueCat through TrackHub.
+1. Resolve TrackHub 3.1.1+ and confirm the dependency graph contains no Apphud or RevenueCat through TrackHub.
 2. For Google-promoted iOS apps, select `TrackHubGoogleODM`, verify the resolved Google ODM/Firebase versions, and start through `TrackHubGoogleODM.start`.
 3. Add a truthful `NSUserTrackingUsageDescription`; present the host explanation and call `requestAppTrackingTransparency` while the app is active.
 4. If Singular coexists and Daively owns conversion values, set `manualSkanConversionManagement = true`; keep Singular ODM enabled when its external reporting is required.

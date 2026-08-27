@@ -185,6 +185,34 @@ final class TrackHubTests: XCTestCase {
             installAlreadySent: false,
             privacyStopped: true
         ))
+
+        // A valid callback remains acceptable after the five-second delivery
+        // hold expires. Only a new generation, privacy stop or runtime circuit
+        // may discard it.
+        XCTAssertTrue(TrackHub.shouldAcceptGoogleOnDeviceMeasurementInfo(
+            hasMatchingGeneration: true,
+            privacyStopped: false,
+            runtimeCircuitOpen: false,
+            hasValidInfo: true
+        ))
+        XCTAssertFalse(TrackHub.shouldAcceptGoogleOnDeviceMeasurementInfo(
+            hasMatchingGeneration: false,
+            privacyStopped: false,
+            runtimeCircuitOpen: false,
+            hasValidInfo: true
+        ))
+        XCTAssertFalse(TrackHub.shouldAcceptGoogleOnDeviceMeasurementInfo(
+            hasMatchingGeneration: true,
+            privacyStopped: true,
+            runtimeCircuitOpen: false,
+            hasValidInfo: true
+        ))
+        XCTAssertFalse(TrackHub.shouldAcceptGoogleOnDeviceMeasurementInfo(
+            hasMatchingGeneration: true,
+            privacyStopped: false,
+            runtimeCircuitOpen: true,
+            hasValidInfo: true
+        ))
     }
 
     func testRetryIsBoundedAndClockSkewRequiresTheExplicitServerError() throws {
