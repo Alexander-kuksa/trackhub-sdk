@@ -91,6 +91,9 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public var firebaseAppInstanceId: String?
     public var googleOnDeviceMeasurementInfo: String?
     public var googleOnDeviceMeasurementInfoProvider: TrackHubGoogleOnDeviceMeasurementInfoProvider?
+    /// Optional typed provider. Takes precedence over the legacy String? bridge
+    /// and distinguishes empty info from network/provider failures safely.
+    public var googleOnDeviceMeasurementResultProvider: TrackHubGoogleOdmResultProvider?
     /// Maximum time for the optional provider to enrich the first-open report.
     /// Delivery continues fail-silent when the provider times out or returns nil.
     public var googleOnDeviceMeasurementTimeout: TimeInterval = 5
@@ -120,6 +123,7 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
             "firebaseAppInstanceId=\(firebaseAppInstanceId == nil ? "nil" : "<redacted>"), " +
             "googleOnDeviceMeasurementInfo=\(googleOnDeviceMeasurementInfo == nil ? "nil" : "<redacted>"), " +
             "googleOnDeviceMeasurementInfoProvider=\(googleOnDeviceMeasurementInfoProvider != nil), " +
+            "googleOnDeviceMeasurementResultProvider=\(googleOnDeviceMeasurementResultProvider != nil), " +
             "googleOnDeviceMeasurementTimeout=\(googleOnDeviceMeasurementTimeout), " +
             "attributionChangedHandler=\(attributionChangedHandler != nil), " +
             "deferredDeepLinkHandler=\(deferredDeepLinkHandler != nil), " +

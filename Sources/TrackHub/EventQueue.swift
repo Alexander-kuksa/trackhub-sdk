@@ -12,6 +12,8 @@ import Foundation
     public let dedupeKey: String?
     public let attempts: Int
     public let nextAttemptAt: Date
+    public let firstOpenEnrichment: FirstOpenReportEnrichment?
+    public let hasBeenDispatched: Bool
 
     public init(
         id: String = UUID().uuidString,
@@ -21,7 +23,9 @@ import Foundation
         kind: String? = nil,
         dedupeKey: String? = nil,
         attempts: Int = 0,
-        nextAttemptAt: Date = .distantPast
+        nextAttemptAt: Date = .distantPast,
+        firstOpenEnrichment: FirstOpenReportEnrichment? = nil,
+        hasBeenDispatched: Bool = false
     ) {
         self.id = id
         self.path = path
@@ -31,10 +35,13 @@ import Foundation
         self.dedupeKey = dedupeKey
         self.attempts = max(0, attempts)
         self.nextAttemptAt = nextAttemptAt
+        self.firstOpenEnrichment = firstOpenEnrichment
+        self.hasBeenDispatched = hasBeenDispatched
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, path, body, createdAt, kind, dedupeKey, attempts, nextAttemptAt
+        case firstOpenEnrichment, hasBeenDispatched
     }
 
     public init(from decoder: Decoder) throws {
@@ -47,6 +54,8 @@ import Foundation
         dedupeKey = try values.decodeIfPresent(String.self, forKey: .dedupeKey)
         attempts = max(0, try values.decodeIfPresent(Int.self, forKey: .attempts) ?? 0)
         nextAttemptAt = try values.decodeIfPresent(Date.self, forKey: .nextAttemptAt) ?? .distantPast
+        firstOpenEnrichment = try values.decodeIfPresent(FirstOpenReportEnrichment.self, forKey: .firstOpenEnrichment)
+        hasBeenDispatched = try values.decodeIfPresent(Bool.self, forKey: .hasBeenDispatched) ?? (attempts > 0)
     }
 }
 
@@ -134,13 +143,17 @@ import Foundation
         if let key = report.dedupeKey,
            let index = items.firstIndex(where: { $0.dedupeKey == key }) {
             let existing = items[index]
+            // A late provider callback must not rewrite an in-flight or
+            // retrying install. Its cached signal is for unsent events only.
+            if existing.hasBeenDispatched || existing.attempts > 0 { return existing.id }
             stored = PendingReport(
                 id: existing.id,
                 path: report.path,
                 body: report.body,
                 createdAt: existing.createdAt,
                 kind: report.kind,
-                dedupeKey: key
+                dedupeKey: key,
+                firstOpenEnrichment: report.firstOpenEnrichment
             )
             items[index] = stored
         } else {
@@ -162,6 +175,43 @@ import Foundation
     /// caller should retry later when this returns false.
     public func prepareForDelivery() -> Bool {
         reloadStorageIfNeeded()
+    }
+
+    /// Persist the exact first wire body BEFORE HTTP starts. Restart/retry and
+    /// dedupe replacement cannot attach a later signal to an attempted report.
+    /// Enrichment exceeding queue limits falls back to the original body,
+    /// without evicting other events or expanding the offline storage budget.
+    public func prepareNextForDispatch(
+        capacityFallback: (PendingReport) -> Data? = { _ in nil },
+        enrich: (PendingReport) -> Data?
+    ) -> PendingReport? {
+        guard reloadStorageIfNeeded(), let report = nextForDelivery,
+              let index = items.firstIndex(where: { $0.id == report.id }) else { return nil }
+        if report.hasBeenDispatched { return report }
+        func frozen(_ body: Data) -> PendingReport {
+            PendingReport(id: report.id, path: report.path, body: body,
+                          createdAt: report.createdAt, kind: report.kind, dedupeKey: report.dedupeKey,
+                          attempts: report.attempts, nextAttemptAt: report.nextAttemptAt,
+                          hasBeenDispatched: true)
+        }
+        let enriched = report.attempts == 0 ? enrich(report) : nil
+        items[index] = frozen(enriched ?? report.body)
+        if items[index].body.count > maxItemBytes
+            || ((try? JSONEncoder().encode(items).count) ?? (maxBytes + 1)) > maxBytes {
+            // A privacy scrub must not be undone by falling back to a snapshot
+            // containing an IDFA whose consent has since been withdrawn.
+            items[index] = frozen(capacityFallback(report) ?? report.body)
+        }
+        guard items[index].body.count <= maxItemBytes,
+              let encodedSize = try? JSONEncoder().encode(items).count, encodedSize <= maxBytes else {
+            items[index] = report
+            return nil
+        }
+        guard persist() else {
+            items[index] = report
+            return nil
+        }
+        return items[index]
     }
 
     @discardableResult
@@ -187,7 +237,9 @@ import Foundation
             kind: previous.kind,
             dedupeKey: previous.dedupeKey,
             attempts: attempts,
-            nextAttemptAt: nextAttemptAt
+            nextAttemptAt: nextAttemptAt,
+            firstOpenEnrichment: previous.firstOpenEnrichment,
+            hasBeenDispatched: previous.hasBeenDispatched
         )
         guard persist() else {
             items[index] = previous
