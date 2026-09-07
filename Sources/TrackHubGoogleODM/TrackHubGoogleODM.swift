@@ -16,27 +16,29 @@ public enum TrackHubGoogleODM {
     public static func start(_ configuration: TrackHubConfig) {
         var enriched = configuration
         if enriched.googleOnDeviceMeasurementInfoProvider == nil,
+           enriched.googleOnDeviceMeasurementResultProvider == nil,
            enriched.googleOnDeviceMeasurementInfo == nil {
-            enriched.googleOnDeviceMeasurementInfoProvider = provider
+            enriched.googleOnDeviceMeasurementResultProvider = resultProvider
         }
         TrackHub.start(enriched)
     }
 
     public static let provider: TrackHubGoogleOnDeviceMeasurementInfoProvider = {
+        firstOpenAt, completion in
+        resultProvider(firstOpenAt) { completion($0.info) }
+    }
+
+    public static let resultProvider: TrackHubGoogleOdmResultProvider = {
         firstOpenAt,
         completion in
         #if os(iOS) && !targetEnvironment(macCatalyst)
         let manager = ConversionManager.sharedInstance
         manager.setFirstLaunchTime(firstOpenAt)
         manager.fetchAggregateConversionInfo(for: .installation) { info, error in
-            guard error == nil, let info, !info.isEmpty else {
-                completion(nil)
-                return
-            }
-            completion(info)
+            completion(.fromProvider(info: info, error: error))
         }
         #else
-        completion(nil)
+        completion(.unsupported)
         #endif
     }
 }
