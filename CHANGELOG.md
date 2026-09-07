@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased — initial delivery signal consistency and ODM diagnostics
+## 3.1.2 — 2026-09-08
 
-This is not part of the published 3.1.1 tag. Do not replace a deployed 3.1.1
-artifact or assume existing App Store installations receive these changes.
+Initial delivery signal consistency and ODM diagnostics. These changes require
+a host-app update with SDK 3.1.2; existing 3.1.1 installations are unchanged.
 
 - Events buffered during the initial ATT/ODM hold can receive the current
   permitted IDFA/IDFV and cached ODM immediately before their first dispatch.
