@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.1.1"
+    public static let sdkVersion = "3.1.2"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -231,8 +231,9 @@ public enum TrackHub {
         let explicitOdmInfo = boundedOdmInfo(configuration.googleOnDeviceMeasurementInfo)
         let cachedOdmInfo = boundedOdmInfo(UserDefaults.standard.string(forKey: odmInfoKey))
         let provider = configuration.googleOnDeviceMeasurementInfoProvider
+        let resultProvider = configuration.googleOnDeviceMeasurementResultProvider
         let shouldFetchOdmInfo = shouldFetchGoogleOnDeviceMeasurementInfo(
-            hasProvider: provider != nil,
+            hasProvider: provider != nil || resultProvider != nil,
             hasExplicitInfo: explicitOdmInfo != nil,
             hasCachedInfo: cachedOdmInfo != nil,
             installAlreadySent: UserDefaults.standard.bool(forKey: installSentKey),
@@ -367,16 +368,21 @@ public enum TrackHub {
         #else
         applyConfiguration(nil)
         #endif
-        if let provider, let odmFetchToken {
+        if let odmFetchToken {
             // start(_:) is @MainActor, so provider SDKs with main-thread APIs
             // can be called without dispatching or blocking the host UI.
-            provider(firstOpenAt) { info in
+            let completion: @Sendable (TrackHubGoogleOdmResult) -> Void = { result in
                 queue.async {
                     completeGoogleOnDeviceMeasurementFetch(
                         token: odmFetchToken,
-                        info: info
+                        result: result
                     )
                 }
+            }
+            if let resultProvider {
+                resultProvider(firstOpenAt, completion)
+            } else if let provider {
+                provider(firstOpenAt) { completion(.fromProvider(info: $0, error: nil)) }
             }
         }
     }
@@ -633,6 +639,7 @@ public enum TrackHub {
         odmInfoDelayWorkItem?.cancel()
         odmInfoDelayWorkItem = nil
         log("first-open Google ODM wait ended (timeout after \(Int(interval))s)")
+        reportGoogleOdmDiagnostic(reason: "odm_timeout", token: token, phase: "timeout")
         flush()
     }
 
@@ -640,9 +647,9 @@ public enum TrackHub {
     // the callback inert. Provider completion and timeout may race safely.
     private static func completeGoogleOnDeviceMeasurementFetch(
         token: UUID,
-        info: String?
+        result: TrackHubGoogleOdmResult
     ) {
-        let value = boundedOdmInfo(info)
+        let value = result.info
         let outcome = odmDeliveryState.complete(
             token: token,
             privacyStopped: trackingDisabled || isPrivacyStopRequested(),
@@ -664,7 +671,21 @@ public enum TrackHub {
             odmInfoDelayWorkItem = nil
         }
         log("first-open Google ODM provider completed (\(value == nil ? "no info" : "info cached"))")
+        reportGoogleOdmDiagnostic(reason: result.diagnosticReason, token: token, phase: "completion")
         flush()
+    }
+
+    /// At most one timeout and one completion per fetch generation. Uses the
+    /// existing signed, bounded diagnostic queue; no install/user ID, ODM blob,
+    /// error text, URL or advertising ID is included. Not a Google conversion.
+    private static func reportGoogleOdmDiagnostic(reason: String, token: UUID, phase: String) {
+        guard config != nil, config?.integrationTestToken == nil,
+              firstOpenSignalEnrichmentAllowed() else { return }
+        _ = send(path: "sdk/diagnostic", body: [
+            "id": UUID().uuidString.lowercased(), "sdk_source": "trackhub-ios",
+            "sdk_version": Self.sdkVersion, "reason": reason,
+            "occurred_at": iso8601.string(from: Date()),
+        ], kind: "sdk_odm_diagnostic", dedupeKey: "sdk_odm:\(token):\(phase)")
     }
 
     @_spi(Testing) public static func shouldAcceptGoogleOnDeviceMeasurementInfo(
@@ -2164,7 +2185,8 @@ public enum TrackHub {
             path: path,
             body: data,
             kind: kind,
-            dedupeKey: dedupeKey
+            dedupeKey: dedupeKey,
+            firstOpenEnrichment: firstOpenEnrichmentEligibility(path: path, body: payload)
         )
         guard let reportID = targetQueue.enqueue(report) else {
             if targetQueue.storageFailure {
@@ -2188,7 +2210,7 @@ public enum TrackHub {
     // Drain exactly one report at a time; each is signed FRESH at send time so
     // a stale timestamp never rejects buffered traffic.
     private static func flush() {
-        guard !trackingDisabled, !isRuntimeCircuitOpen() else { return }
+        guard !trackingDisabled, !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return }
         guard !firstOpenDeliveryDelayActive else { return }
         guard !deliveryInFlight else { return }
         guard let targetQueue = eventQueue else { return }
@@ -2215,17 +2237,41 @@ public enum TrackHub {
         transientRetryNotBefore = nil
         guard let networkConfig = currentNetworkConfig() else { return }
 
+        guard let prepared = targetQueue.prepareNextForDispatch(capacityFallback: { pending in
+            pending.firstOpenEnrichment?.bodyForFirstDispatch(
+                report: pending, currentInstallUid: resolveInstallUid(), signals: [:],
+                measurementAllowed: false, now: Date()
+            )
+        }, enrich: { pending in
+            guard let eligibility = pending.firstOpenEnrichment else { return nil }
+            var signals: [String: Any] = [:]
+            appendOdmInfo(to: &signals)
+            appendAppConversionDeviceIdentifier(to: &signals)
+            return eligibility.bodyForFirstDispatch(
+                report: pending, currentInstallUid: resolveInstallUid(), signals: signals,
+                measurementAllowed: firstOpenSignalEnrichmentAllowed(), now: Date()
+            )
+        }) else {
+            if targetQueue.storageFailure {
+                openRuntimeCircuit(.storage, detail: "cannot persist first-dispatch payload")
+            } else {
+                scheduleRetry(at: Date().addingTimeInterval(30))
+            }
+            return
+        }
+        guard !isPrivacyStopRequested() else { return }
+
         deliveryInFlight = true
         postRaw(
             config: networkConfig,
-            path: report.path,
-            bodyData: report.body
+            path: prepared.path,
+            bodyData: prepared.body
         ) { status, responseData in
             queue.async {
                 deliveryInFlight = false
                 handleDeliveryResult(
                     targetQueue: targetQueue,
-                    report: report,
+                    report: prepared,
                     status: status,
                     responseData: responseData
                 )
@@ -2439,6 +2485,29 @@ public enum TrackHub {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, value.utf8.count <= 4096 else { return nil }
         return value
+    }
+
+    private static func firstOpenSignalEnrichmentAllowed() -> Bool {
+        guard !trackingDisabled, !isPrivacyStopRequested(), !isRuntimeCircuitOpen() else { return false }
+        let defaults = UserDefaults.standard
+        return [adUserDataKey, piplConsentKey, crossBorderTransferConsentKey, adsMeasurementConsentKey]
+            .allSatisfy { defaults.object(forKey: $0) == nil || defaults.bool(forKey: $0) }
+    }
+
+    private static func firstOpenEnrichmentEligibility(path: String, body: [String: Any]) -> FirstOpenReportEnrichment? {
+        guard firstOpenDeliveryDelayActive, FirstOpenReportEnrichment.paths.contains(path),
+              firstOpenSignalEnrichmentAllowed(),
+              let installUid = body["install_uid"] as? String,
+              installUid == resolveInstallUid() else { return nil }
+        let expiresAt = resolveFirstOpenAt().addingTimeInterval(FirstOpenReportEnrichment.maximumAge)
+        guard Date() <= expiresAt else { return nil }
+        var allowAdvertisingId = false
+        #if os(iOS) && canImport(AppTrackingTransparency)
+        let att = ATTrackingManager.trackingAuthorizationStatus
+        allowAdvertisingId = att == .notDetermined || att == .authorized
+        #endif
+        return FirstOpenReportEnrichment(installUid: installUid, expiresAt: expiresAt,
+                                        allowAdvertisingId: allowAdvertisingId)
     }
 
     private static func appendOdmInfo(to body: inout [String: Any]) {
