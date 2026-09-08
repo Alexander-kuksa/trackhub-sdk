@@ -63,6 +63,15 @@ public enum TrackHubDeliveryFailure: Sendable, Equatable {
     case credentialsRejected(path: String)
 }
 
+/// Ownership of Apple SKAdNetwork / AdAttributionKit writes only. This is not
+/// an analytics, Google ODM, consent, or Google Ads Primary/Secondary switch.
+public enum TrackHubAppleAttributionMode: String, Sendable, Equatable {
+    /// Daively registers attribution and applies its conversion-value schema.
+    case active
+    /// Another SDK owns Apple attribution. Daively makes no Apple writes.
+    case passive
+}
+
 public typealias TrackHubDeliveryFailureHandler = @Sendable (TrackHubDeliveryFailure) -> Void
 
 /// Host bridge to Google's optional On-Device Measurement SDK. TrackHub keeps
@@ -84,6 +93,10 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
     public let sdkKey: String
     public let environment: TrackHubEnvironment
     public var debugLogging = false
+    /// Set before start. Active preserves existing integrations. Passive does
+    /// not stop event/identity/billing-context/ODM delivery. Once passive has
+    /// been selected, another start cannot re-enable Apple writes this process.
+    public var appleAttributionMode: TrackHubAppleAttributionMode = .active
     public var countryCode: String?
     public var attConsentWaitingInterval: TimeInterval = Self.defaultATTConsentWaitingInterval
     public var googleAdsConsent = TrackHubGoogleAdsConsent()
@@ -118,6 +131,7 @@ public struct TrackHubConfig: Sendable, CustomStringConvertible {
             "sdkKey=<redacted>, " +
             "environment=\(environmentDescription), " +
             "debugLogging=\(debugLogging), " +
+            "appleAttributionMode=\(appleAttributionMode.rawValue), " +
             "countryCode=\(countryCode ?? "nil"), " +
             "attConsentWaitingInterval=\(attConsentWaitingInterval), " +
             "firebaseAppInstanceId=\(firebaseAppInstanceId == nil ? "nil" : "<redacted>"), " +

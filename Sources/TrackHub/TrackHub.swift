@@ -75,7 +75,7 @@ public enum TrackHubSalesEvent: String, Sendable, Equatable {
 
 public enum TrackHub {
     /// SDK version reported to the platform for integration detection.
-    public static let sdkVersion = "3.1.2"
+    public static let sdkVersion = "3.1.3"
 
     private static let queue = DispatchQueue(label: "com.trackhub.sdk")
     private static var config: Config?
@@ -126,6 +126,7 @@ public enum TrackHub {
         let sdkSecret: String?
         let integrationTestToken: String?
         let attConsentWaitingInterval: TimeInterval
+        let appleAttributionPermit: AppleAttributionPermit?
         let attributionChangedHandler: TrackHubAttributionChangedHandler?
         let deferredDeepLinkHandler: TrackHubDeferredDeepLinkHandler?
         let deliveryFailureHandler: TrackHubDeliveryFailureHandler?
@@ -228,6 +229,10 @@ public enum TrackHub {
             print("[TrackHub] refusing non-HTTPS endpoint \(endpoint) — SDK not started")
             return
         }
+        let appleAttributionPermit = SKANUpdater.configure(
+            mode: configuration.appleAttributionMode,
+            integrationTest: configuration.environment.testToken != nil
+        )
         let explicitOdmInfo = boundedOdmInfo(configuration.googleOnDeviceMeasurementInfo)
         let cachedOdmInfo = boundedOdmInfo(UserDefaults.standard.string(forKey: odmInfoKey))
         let provider = configuration.googleOnDeviceMeasurementInfoProvider
@@ -260,6 +265,7 @@ public enum TrackHub {
                 sdkSecret: sdkSecret,
                 integrationTestToken: configuration.environment.testToken,
                 attConsentWaitingInterval: normalizedATTConsentWaitingInterval(configuration.attConsentWaitingInterval),
+                appleAttributionPermit: appleAttributionPermit,
                 attributionChangedHandler: configuration.attributionChangedHandler,
                 deferredDeepLinkHandler: configuration.deferredDeepLinkHandler,
                 deliveryFailureHandler: configuration.deliveryFailureHandler
@@ -336,7 +342,7 @@ public enum TrackHub {
                 token: odmFetchToken,
                 waitingInterval: configuration.googleOnDeviceMeasurementTimeout
             )
-            schema = loadCachedSchema()
+            schema = appleAttributionPermit == nil ? nil : loadCachedSchema()
             sessionTracker = sessionTracker ?? SessionTracker()
             // Test Lab reports must never drain the production offline queue.
             // Keep the same in-memory instance for repeated start calls in
@@ -347,8 +353,8 @@ public enum TrackHub {
             transientRetryNotBefore = nil
             startATTConsentDelayIfNeeded()
             reportRuntimeCircuitDiagnosticIfNeeded()
-            if config?.integrationTestToken == nil {
-                SKANUpdater.registerForAttribution()
+            if let appleAttributionPermit {
+                SKANUpdater.registerForAttribution(permit: appleAttributionPermit)
                 applyLocalInstallConversionRule()
             }
             reportInstallIfNeeded()
@@ -1217,8 +1223,8 @@ public enum TrackHub {
     ) {
         queue.async {
             guard !isRuntimeCircuitOpen() else { return }
-            guard config?.integrationTestToken == nil else {
-                return log("Apple conversion update suppressed in Integration Test Lab")
+            guard let permit = config?.appleAttributionPermit else {
+                return log("Apple conversion update suppressed: passive or Integration Test Lab")
             }
             guard let schema else { return log("track(\(event)) before schema is available — skipped") }
             guard let update = ConversionEncoder.encode(schema: schema, event: event, revenueCents: revenueCents) else {
@@ -1241,7 +1247,8 @@ public enum TrackHub {
             SKANUpdater.apply(
                 safeUpdate,
                 adAttributionTarget: adAttributionTarget,
-                conversionTag: resolvedTag
+                conversionTag: resolvedTag,
+                permit: permit
             )
         }
     }
@@ -1462,7 +1469,7 @@ public enum TrackHub {
 
     private static func refreshSchema() {
         guard !isRuntimeCircuitOpen() else { return }
-        guard let config else { return }
+        guard let config, let permit = config.appleAttributionPermit else { return }
         let url = config.endpoint.appendingPathComponent("ingest").appendingPathComponent(config.ingestToken).appendingPathComponent("cv-schema")
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -1472,6 +1479,7 @@ public enum TrackHub {
                 return log("schema refresh failed — using cached version")
             }
             queue.async {
+                guard self.config?.appleAttributionPermit == permit else { return }
                 schema = fetched
                 UserDefaults.standard.set(data, forKey: schemaCacheKey)
                 log("schema v\(fetched.schemaVersion) active (\(fetched.rules.count) rules)")
@@ -1484,6 +1492,7 @@ public enum TrackHub {
     // assigns install/first_open a different value, apply that configured value
     // as soon as cached or freshly fetched schema data is available.
     private static func applyLocalInstallConversionRule() {
+        guard let permit = config?.appleAttributionPermit else { return }
         guard config?.integrationTestToken == nil else { return }
         guard let schema, let window = currentInstallConversionWindow() else { return }
         let updates = ["install", "first_open"].compactMap { event -> ConversionUpdate? in
@@ -1503,7 +1512,8 @@ public enum TrackHub {
         SKANUpdater.apply(
             update,
             adAttributionTarget: .install,
-            conversionTag: nil
+            conversionTag: nil,
+            permit: permit
         )
     }
 
@@ -1512,6 +1522,7 @@ public enum TrackHub {
     // also carry the same update.
     private static func syncServerConversionValue() {
         guard let config,
+              config.appleAttributionPermit != nil,
               config.integrationTestToken == nil,
               config.sdkSecret?.isEmpty == false else { return }
         let installUid = resolveInstallUid()
@@ -1539,7 +1550,8 @@ public enum TrackHub {
     }
 
     private static func applyServerConversionResponse(_ data: Data?) {
-        guard let instruction = decodeServerConversionInstruction(data),
+        guard let permit = config?.appleAttributionPermit,
+              let instruction = decodeServerConversionInstruction(data),
               let update = instruction.update else { return }
         guard currentInstallConversionWindow() == instruction.window else {
             return log("server conversion response belongs to a different Apple window — skipped")
@@ -1552,7 +1564,8 @@ public enum TrackHub {
         SKANUpdater.apply(
             safeUpdate,
             adAttributionTarget: .install,
-            conversionTag: nil
+            conversionTag: nil,
+            permit: permit
         )
     }
 
@@ -2774,6 +2787,12 @@ public enum TrackHub {
         let value = runtimeCircuitOpen
         runtimeCircuitLock.unlock()
         return value
+    }
+
+    // Called on MainActor by the Apple writer. Read only lock-protected stop
+    // state, not mutable state owned by TrackHub.queue.
+    static func appleAttributionWritesSuppressed() -> Bool {
+        isPrivacyStopRequested() || isRuntimeCircuitOpen()
     }
 
     private static func openRuntimeCircuit(_ reason: RuntimeCircuitReason, detail: String) {

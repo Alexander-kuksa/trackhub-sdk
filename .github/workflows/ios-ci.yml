@@ -18,6 +18,8 @@ jobs:
       - run: swift build
       - run: swift test
       - run: swift run encoder-tests
+      - name: Active and passive local delivery smoke
+        run: node Tests/loopback-smoke.mjs
       - name: Compile for iOS Simulator
         run: xcodebuild -scheme TrackHub -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
       - name: Compile Google ODM adapter for iOS Simulator

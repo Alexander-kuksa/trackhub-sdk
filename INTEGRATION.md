@@ -1,4 +1,7 @@
-# TrackHub iOS 3.1 integration reference
+# TrackHub iOS 3.1.3 integration reference
+
+Pin **Exact Version 3.1.3** and commit the host application's `Package.resolved`.
+Do not change the resolved dependency set between QA and Release upload.
 
 ## Contract
 
@@ -21,7 +24,7 @@ first report can no longer regenerate Google's `fot`. If the timestamp cannot
 be persisted, the process-local storage circuit stops measurement without
 blocking or crashing the host application; the next launch retries.
 
-## Google integrated conversion measurement (3.1.1+ recommended)
+## Google integrated conversion measurement (3.1.3 recommended)
 
 For iOS applications promoted by Google, select the `TrackHubGoogleODM` Swift
 package product. It adds Google's official On-Device Measurement runtime as an
@@ -124,6 +127,50 @@ report without IDFA. Set the interval to `0` only when the app intentionally has
 no ATT flow. A truthful `NSUserTrackingUsageDescription` must be present in the
 host Info.plist; TrackHub intentionally never presents Apple's prompt by itself.
 
+### Apple attribution ownership: active or passive (3.1.3)
+
+Choose once in the startup configuration, before calling either start helper:
+
+```swift
+var config = TrackHubConfig(sdkKey: "<DAIVELY_SDK_KEY>")
+config.appleAttributionMode = .passive // AppsFlyer / Singular / Adjust owns Apple CVs
+TrackHubGoogleODM.start(config)
+```
+
+The default is `.active`: Daively registers Apple attribution and applies its
+SKAN/AdAttributionKit conversion-value schema. Keep that default when Daively
+owns conversion values, and disable competing Apple writes in the other SDK.
+
+In `.passive`, Daively does **not** register Apple attribution or write any
+conversion value, even initial zero, a cached schema, a server instruction,
+re-engagement, coarse value or lock-window update. It continues reporting
+installs, sessions, events, external billing identities and purchase context;
+the optional Google ODM bridge, consent and privacy APIs remain functional.
+The existing privacy rules still apply. Revenue remains server-authoritative.
+
+Start once. Once passive is selected, an accidental second start with default
+active configuration cannot re-enable Apple writes in that process. Configure
+the intended owner on the next launch; do not use repeated starts as a dynamic
+handoff inside an Apple attribution window. A call already issued to Apple
+cannot be undone by a later mode change.
+
+This mode is independent of Google Ads Primary/Secondary. To use another MMP
+as the primary measurement provider, configure its Ads actions separately and
+avoid counting both equivalent actions as bidding conversions. Keep one
+compatible Google ODM runtime in the combined host dependency graph.
+
+Postback copies are delivered by Apple/server integrations, not read from
+another SDK by passive mode. The plist copy endpoint keys each select one
+destination. If that destination belongs to another MMP, delivery to Daively
+requires a separately configured and verified supported forwarding path; it
+is not provided automatically by this release. If Daively receives copies
+encoded by an external owner, do not decode them with a different Daively schema.
+
+Release gate: test an actual archived host app in passive with the external
+writer enabled and confirm **zero Daively Apple calls**, while its normal
+events/ODM reach Daively. In active verify fine/coarse/lock and re-engagement
+still work. An empty server schema is not a substitute for passive mode.
+
 ### Coexisting with Singular while Daively owns conversion values
 
 For Daively-managed SKAN/AdAttributionKit conversion values, stop Singular from
@@ -142,6 +189,9 @@ the application's Firebase/Singular dependency graph. The manual-SKAN flag only
 chooses who writes Apple's conversion values; it does not disable Singular event
 reporting or ODM. Another application may choose another conversion-value owner,
 but exactly one SDK must write those values.
+
+Keep `$(inherited) -ObjC` in both Debug and Release when using Singular ODM and
+verify the effective host archive settings, not only the SDK package build.
 
 ```swift
 TrackHub.setExternalIdentity(provider: "apphud", userId: Apphud.userID())
