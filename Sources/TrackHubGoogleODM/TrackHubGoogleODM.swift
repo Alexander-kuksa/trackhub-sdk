@@ -14,13 +14,19 @@ import GoogleAdsOnDeviceConversion
 public enum TrackHubGoogleODM {
     @MainActor
     public static func start(_ configuration: TrackHubConfig) {
+        TrackHub.start(configurationWithDefaultProvider(configuration))
+    }
+
+    // Preserve the host's Apple attribution mode and consent settings. ODM
+    // collection is independent from ownership of SKAN/AdAttributionKit.
+    static func configurationWithDefaultProvider(_ configuration: TrackHubConfig) -> TrackHubConfig {
         var enriched = configuration
         if enriched.googleOnDeviceMeasurementInfoProvider == nil,
            enriched.googleOnDeviceMeasurementResultProvider == nil,
            enriched.googleOnDeviceMeasurementInfo == nil {
             enriched.googleOnDeviceMeasurementResultProvider = resultProvider
         }
-        TrackHub.start(enriched)
+        return enriched
     }
 
     public static let provider: TrackHubGoogleOnDeviceMeasurementInfoProvider = {

@@ -60,7 +60,7 @@ let package = Package(
         ),
         .testTarget(
             name: "TrackHubTests",
-            dependencies: ["TrackHub"],
+            dependencies: ["TrackHub", "TrackHubGoogleODM"],
             path: "Tests/TrackHubTests"
         ),
     ]
